@@ -21,25 +21,25 @@ download() { curl -fLsS --retry 3 --connect-timeout 15 "$1" -o "$2"; }
 
 install_packages() {
     missing=""
-    for command in python3 rsync ssh lftp curl openssl socat crontab; do
+    for command in python3 rsync ssh sshpass lftp curl openssl socat crontab; do
         command -v "$command" >/dev/null 2>&1 || missing=1
     done
     [ -x "$ACME" ] || missing=1
     [ -z "$missing" ] && return
-    echo "正在安装 Python 3、rsync、lftp、SSH、curl、OpenSSL、socat 和定时任务服务……"
+    echo "正在安装 Python 3、rsync、lftp、SSH、sshpass、curl、OpenSSL、socat 和定时任务服务……"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y python3 rsync lftp openssh-client curl openssl ca-certificates socat cron
+        DEBIAN_FRONTEND=noninteractive apt-get install -y python3 rsync lftp openssh-client sshpass curl openssl ca-certificates socat cron
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y python3 rsync lftp openssh-clients curl openssl ca-certificates socat cronie
+        dnf install -y python3 rsync lftp openssh-clients sshpass curl openssl ca-certificates socat cronie
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y python3 rsync lftp openssh-clients curl openssl ca-certificates socat cronie
+        yum install -y python3 rsync lftp openssh-clients sshpass curl openssl ca-certificates socat cronie
     elif command -v zypper >/dev/null 2>&1; then
-        zypper --non-interactive install python3 rsync lftp openssh curl openssl ca-certificates socat cron
+        zypper --non-interactive install python3 rsync lftp openssh sshpass curl openssl ca-certificates socat cron
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm python rsync lftp openssh curl openssl ca-certificates socat cronie
+        pacman -Sy --noconfirm python rsync lftp openssh sshpass curl openssl ca-certificates socat cronie
     elif command -v apk >/dev/null 2>&1; then
-        apk add python3 rsync lftp openssh-client curl openssl ca-certificates socat
+        apk add python3 rsync lftp openssh-client sshpass curl openssl ca-certificates socat
     else
         echo "无法识别包管理器，请手动安装 python3、rsync、lftp、ssh、curl、openssl、socat 和 cron。"
         exit 1
@@ -77,11 +77,11 @@ PY
 }
 
 open_firewall() {
-    port=$1
+    firewall_port=$1
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        ufw allow "$port/tcp" >/dev/null
+        ufw allow "$firewall_port/tcp" >/dev/null
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="$port/tcp" >/dev/null
+        firewall-cmd --permanent --add-port="$firewall_port/tcp" >/dev/null
         firewall-cmd --reload >/dev/null
     fi
 }
@@ -269,6 +269,24 @@ update_app() {
     download_release
     if [ ! -s "$CERT" ] || [ ! -s "$KEY" ] || ! openssl x509 -in "$CERT" -issuer -noout 2>/dev/null | grep -qi "Let's Encrypt"; then
         issue_ip_certificate
+    fi
+    current_port=$(python3 -c 'import json; print(json.load(open("/var/lib/simple-backup/config.json")).get("listen_port",8088))')
+    if [ "$current_port" = 80 ]; then
+        port_free 8088 || { echo "检测到旧安装端口错误为 80，但 8088 已被占用；请先运行菜单第 6 项修改端口。"; exit 1; }
+        python3 - "$DATA_DIR/config.json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    config = json.load(source)
+config["listen_port"] = 8088
+temp = path + ".tmp"
+with open(temp, "w", encoding="utf-8") as target:
+    json.dump(config, target, ensure_ascii=False, indent=2)
+os.chmod(temp, 0o600)
+os.replace(temp, path)
+PY
+        open_firewall 8088
+        echo "已修复旧安装器造成的端口错误：面板从 80 迁移到 8088。"
     fi
     setup_service
     echo "更新完成。"

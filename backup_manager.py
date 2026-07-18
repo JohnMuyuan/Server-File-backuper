@@ -42,7 +42,7 @@ TASK_DEFAULTS = {
     "remote_user": "root", "remote_path": "/", "ssh_key": "/root/.ssh/id_ed25519",
     "backup_dir": "/var/backups/simple-backup", "interval_days": 3,
     "retention_limit": 0, "transfer_threads": 4, "enabled": True,
-    "auto_install_dependencies": True,
+    "auto_install_dependencies": True, "auth_method": "key",
 }
 
 
@@ -56,17 +56,24 @@ def atomic_json(path, value):
 
 
 def password_fields(password):
-    if len(password) < 10 or any(ord(char) < 32 for char in password):
-        raise ValueError("管理密码至少需要 10 位，且不能包含控制字符")
+    if not 10 <= len(password) <= 256 or any(ord(char) < 32 for char in password):
+        raise ValueError("管理密码需要 10-256 位，且不能包含控制字符")
     salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
-    return {"password_salt": salt.hex(), "password_hash": digest.hex()}
+    iterations = 600_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return {
+        "password_salt": salt.hex(), "password_hash": digest.hex(),
+        "password_iterations": iterations,
+    }
 
 
 def verify_password(config, password):
     try:
+        if len(password) > 256:
+            return False
         digest = hashlib.pbkdf2_hmac(
-            "sha256", password.encode(), bytes.fromhex(config["password_salt"]), 200_000
+            "sha256", password.encode(), bytes.fromhex(config["password_salt"]),
+            int(config.get("password_iterations", 200_000)),
         ).hex()
         return hmac.compare_digest(digest, config["password_hash"])
     except (KeyError, ValueError):
@@ -115,6 +122,7 @@ def validate_task(raw, existing_id=""):
         raise ValueError("端口、周期、保留份数和线程数必须是数字") from exc
     task["enabled"] = bool(task.get("enabled"))
     task["auto_install_dependencies"] = bool(task.get("auto_install_dependencies"))
+    task["auth_method"] = str(task.get("auth_method", "key"))
     if not re.fullmatch(r"[a-f0-9]{8}", task["id"]):
         raise ValueError("任务 ID 无效")
     if not 1 <= len(task["name"]) <= 50 or any(ord(c) < 32 for c in task["name"]):
@@ -129,6 +137,8 @@ def validate_task(raw, existing_id=""):
         raise ValueError("本地备份目录必须是绝对路径，且不能是根目录")
     if task["ssh_key"] and not Path(task["ssh_key"]).is_absolute():
         raise ValueError("SSH 密钥路径必须是绝对路径")
+    if task["auth_method"] not in ("key", "password"):
+        raise ValueError("SSH 认证方式无效")
     if not 1 <= task["remote_port"] <= 65535:
         raise ValueError("SSH 端口必须在 1-65535 之间")
     if not 0.01 <= task["interval_days"] <= 3650:
@@ -180,6 +190,7 @@ class BackupApp:
         self.data_dir = Path(data_dir)
         self.config_path = self.data_dir / "config.json"
         self.state_path = self.data_dir / "state.json"
+        self.secrets_dir = self.data_dir / "secrets"
         self.lock = threading.RLock()
         self.config = migrate_config(self._read_json(self.config_path, {}))
         self.state = self._read_json(self.state_path, {"tasks": {}, "telegram_offset": 0, "low_disks": {}})
@@ -187,6 +198,8 @@ class BackupApp:
         self.state.setdefault("low_disks", {})
         self.jobs = {}
         self.login_failures = {}
+        self.account_failures = []
+        self.login_lock = threading.Lock()
         self.stop_daemon = threading.Event()
         self._save_config()
         self._save_state()
@@ -214,6 +227,21 @@ class BackupApp:
             "next_run": 0, "last_result": "尚未运行", "last_backup": "",
             "last_error": "", "dependencies_ready": False,
         })
+
+    def secret_path(self, task_id):
+        return self.secrets_dir / f"{task_id}.json"
+
+    def task_password(self, task_id):
+        return self._read_json(self.secret_path(task_id), {}).get("ssh_password", "")
+
+    def set_task_password(self, task_id, password):
+        path = self.secret_path(task_id)
+        if password:
+            self.secrets_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.secrets_dir, 0o700)
+            atomic_json(path, {"ssh_password": password})
+        elif path.exists():
+            path.unlink()
 
     def resolve_task(self, value, allow_single=True):
         value = (value or "").strip()
@@ -248,11 +276,15 @@ class BackupApp:
     def login_allowed(self, address):
         now = time.time()
         attempts = [stamp for stamp in self.login_failures.get(address, []) if now - stamp < 900]
+        self.account_failures = [stamp for stamp in self.account_failures if now - stamp < 900]
         self.login_failures[address] = attempts
-        return len(attempts) < 5 or now - attempts[-1] >= 900
+        return len(attempts) < 5 and len(self.account_failures) < 20
 
     def login_failed(self, address):
-        self.login_failures.setdefault(address, []).append(time.time())
+        now = time.time()
+        self.login_failures.setdefault(address, []).append(now)
+        self.account_failures.append(now)
+        print(f"登录失败：来源 {address}，时间 {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
 
     def notify(self, message):
         token = self.config.get("telegram_bot_token")
@@ -268,20 +300,28 @@ class BackupApp:
             pass
 
     def ssh_options(self, task):
+        password_auth = task["auth_method"] == "password"
         options = [
-            "-p", str(task["remote_port"]), "-o", "BatchMode=yes",
+            "-p", str(task["remote_port"]), "-o", f"BatchMode={'no' if password_auth else 'yes'}",
             "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=4", "-o", "StrictHostKeyChecking=accept-new",
         ]
-        if task["ssh_key"]:
+        if password_auth:
+            options += ["-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no"]
+        elif task["ssh_key"]:
             options += ["-i", task["ssh_key"]]
         return options
+
+    def ssh_program(self, task):
+        prefix = ["sshpass", "-e", "ssh"] if task["auth_method"] == "password" else ["ssh"]
+        return prefix, " ".join(shlex.quote(item) for item in [*prefix, *self.ssh_options(task)])
 
     def remote_setup(self, task, job):
         state = self.task_state(task["id"])
         if state.get("dependencies_ready") or not task["auto_install_dependencies"]:
             return
-        command = ["ssh", *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", "sh", "-s"]
+        prefix, _ = self.ssh_program(task)
+        command = [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", "sh", "-s"]
         code, output = self.execute(command, task, job, stdin=REMOTE_SETUP)
         if code:
             raise RuntimeError("远程依赖自动安装失败：" + (output[-500:] or f"退出码 {code}"))
@@ -294,8 +334,8 @@ class BackupApp:
 
     def transfer_command(self, task, staging):
         destination = str(staging) + "/"
+        _, ssh = self.ssh_program(task)
         if task["transfer_threads"] == 1:
-            ssh = "ssh " + " ".join(shlex.quote(item) for item in self.ssh_options(task))
             return [
                 "rsync", "-a", "--partial", "--append-verify", "--info=progress2",
                 "--protect-args", "--delete", "-e", ssh,
@@ -305,7 +345,7 @@ class BackupApp:
         threads = task["transfer_threads"]
         parallel = max(1, int(threads ** 0.5))
         segments = max(2, threads // parallel)
-        ssh = "ssh -a -x " + " ".join(shlex.quote(item) for item in self.ssh_options(task))
+        ssh += " -a -x"
         script = (
             f"set sftp:connect-program {self.lftp_quote(ssh)}; "
             "set net:timeout 20; set net:max-retries 5; set net:reconnect-interval-base 3; "
@@ -342,11 +382,16 @@ class BackupApp:
         return True
 
     def execute(self, command, task, job, stdin=None):
+        environment = None
+        if task["auth_method"] == "password":
+            environment = os.environ.copy()
+            environment["SSHPASS"] = self.task_password(task["id"])
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 encoding="utf-8", errors="replace", bufsize=1, start_new_session=True,
+                env=environment,
             )
         except FileNotFoundError as exc:
             return 127, f"本机缺少命令：{command[0]}（{exc}）"
@@ -415,8 +460,10 @@ class BackupApp:
     def backup_once(self, task, job):
         if not self.disk_guard(task):
             raise RuntimeError("剩余硬盘容量低于 3 GB")
-        if task["ssh_key"] and not Path(task["ssh_key"]).is_file():
+        if task["auth_method"] == "key" and task["ssh_key"] and not Path(task["ssh_key"]).is_file():
             raise RuntimeError(f"SSH 密钥不存在：{task['ssh_key']}")
+        if task["auth_method"] == "password" and not self.task_password(task["id"]):
+            raise RuntimeError("尚未保存 SSH 密码，请编辑任务后重新填写")
         self.remote_setup(task, job)
         root = Path(task["backup_dir"])
         root.mkdir(parents=True, exist_ok=True)
@@ -593,20 +640,27 @@ class BackupApp:
         ).hexdigest() if token else ""
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{self.esc(title)} - Simple Backup</title><style>
-*{{box-sizing:border-box}}body{{margin:0;background:#f4f7fb;color:#182230;font:15px system-ui,sans-serif}}
+<title>{self.esc(title)} - Simple Backup</title>
+<script>document.documentElement.dataset.theme=localStorage.getItem('sb_theme')||'auto'</script><style>
+:root{{--bg:#f4f7fb;--fg:#182230;--card:#fff;--border:#dde5ef;--muted:#667085;--input:#fff}}
+html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#33445d;--muted:#aab7ca;--input:#111c2d}}
+@media(prefers-color-scheme:dark){{html[data-theme=auto]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#33445d;--muted:#aab7ca;--input:#111c2d}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}}
 header{{background:#17243b;color:white;padding:16px}}nav{{max-width:1100px;margin:auto;display:flex;gap:18px;align-items:center}}
 nav b{{font-size:20px;margin-right:auto}}a{{color:#1769aa;text-decoration:none}}nav a{{color:white}}
 main{{max-width:1100px;margin:24px auto;padding:0 14px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px}}
-.card{{background:white;border:1px solid #dde5ef;border-radius:12px;padding:18px;box-shadow:0 3px 12px #2030400d}}
-.row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.muted{{color:#667085}}.ok{{color:#08783f}}.bad{{color:#b42318}}
-label{{display:block;margin:12px 0 4px;font-weight:600}}input{{width:100%;padding:10px;border:1px solid #b9c5d4;border-radius:7px}}
+.card{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;box-shadow:0 3px 12px #2030400d}}
+.row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.muted{{color:var(--muted)}}.ok{{color:#08783f}}.bad{{color:#e04444}}
+label{{display:block;margin:12px 0 4px;font-weight:600}}input,select{{width:100%;padding:10px;border:1px solid var(--border);border-radius:7px;background:var(--input);color:var(--fg)}}
 input[type=checkbox]{{width:auto}}button,.btn{{border:0;border-radius:7px;padding:9px 14px;background:#1769aa;color:white;cursor:pointer}}
 .danger{{background:#b42318}}.secondary{{background:#667085}}form.inline{{display:inline}}small{{line-height:1.5}}
 </style></head><body><header><nav><b>Simple Backup</b><a href="/">任务</a>
-<a href="/task">新建任务</a><a href="/settings">设置</a><a href="/logout">退出</a></nav></header>
+<a href="/task">新建任务</a><a href="/settings">设置</a><button type="button" id="theme">主题</button><a href="/logout">退出</a></nav></header>
 <main>{body}</main><script>document.querySelectorAll('form').forEach(f=>{{
 if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value='{csrf}';f.appendChild(i)}}}});
+const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}};
+function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent='主题：'+tn[t]}}
+tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto')}};ts(document.documentElement.dataset.theme);
 </script></body></html>"""
 
     def dashboard_html(self, token):
@@ -635,6 +689,7 @@ if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.typ
         task = dict(TASK_DEFAULTS if task is None else task)
         task_id = self.esc(task.get("id", ""))
         checked = lambda key: "checked" if task.get(key) else ""
+        selected = lambda value: "selected" if task.get("auth_method") == value else ""
         backups = self.backups(task) if task.get("id") else []
         backup_rows = "".join(
             f"<div class='row'><code>{self.esc(p.name)}</code><span class='muted'>{human_size(directory_size(p))}</span>"
@@ -653,8 +708,12 @@ if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.typ
 <div class="grid"><div><label>远程服务器 IP / 域名</label><input name="remote_host" required value="{self.esc(task['remote_host'])}">
 <label>SSH 端口</label><input name="remote_port" type="number" min="1" max="65535" required value="{task['remote_port']}">
 <label>SSH 用户名</label><input name="remote_user" required value="{self.esc(task['remote_user'])}">
+<label>SSH 登录方式</label><select name="auth_method"><option value="key" {selected('key')}>SSH 私钥</option>
+<option value="password" {selected('password')}>SSH 密码</option></select>
 <label>SSH 私钥路径</label><input name="ssh_key" value="{self.esc(task['ssh_key'])}">
-<small class="muted">填写备份服务器上的私钥绝对路径，例如 /root/.ssh/id_ed25519。</small></div>
+<small class="muted">使用私钥时填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small>
+<label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password">
+<small class="muted">使用密码登录时填写；编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div>
 <div><label>远程文件或目录</label><input name="remote_path" required value="{self.esc(task['remote_path'])}">
 <label>本地备份目录</label><input name="backup_dir" required value="{self.esc(task['backup_dir'])}">
 <label>每隔几天备份一次</label><input name="interval_days" type="number" min="0.01" max="3650" step="0.01" required value="{task['interval_days']}">
@@ -670,7 +729,7 @@ if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.typ
     def settings_html(self, token):
         body = f"""<section class="card"><h1>面板与通知设置</h1><form method="post" action="/settings">
 <label>面板用户名</label><input name="admin_username" required value="{self.esc(self.config['admin_username'])}">
-<label>新密码</label><input name="password" type="password" minlength="10" autocomplete="new-password">
+<label>新密码</label><input name="password" type="password" minlength="10" maxlength="256" autocomplete="new-password">
 <small class="muted">不修改请留空；新密码至少 10 位。</small>
 <label>Telegram Bot Token</label><input name="telegram_bot_token" value="{self.esc(self.config.get('telegram_bot_token', ''))}">
 <label>Telegram Chat ID</label><input name="telegram_chat_id" value="{self.esc(self.config.get('telegram_chat_id', ''))}">
@@ -682,30 +741,42 @@ if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.typ
         alert = f"<p class='bad'>{html.escape(error)}</p>" if error else ""
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 - Simple Backup</title>
-<style>*{{box-sizing:border-box}}body{{margin:0;background:#eef3f9;font:15px system-ui;color:#182230;display:grid;place-items:center;min-height:100vh}}
-.login{{width:min(390px,calc(100% - 28px));background:white;padding:30px;border-radius:14px;box-shadow:0 12px 36px #17243b24}}
-input{{width:100%;padding:12px;margin:6px 0 16px;border:1px solid #b9c5d4;border-radius:8px}}button{{width:100%;padding:12px;border:0;border-radius:8px;background:#1769aa;color:white}}
-.bad{{color:#b42318}}</style></head><body><form class="login" method="post" action="/login">
+<script>document.documentElement.dataset.theme=localStorage.getItem('sb_theme')||'auto'</script><style>
+:root{{--bg:#eef3f9;--fg:#182230;--card:#fff;--border:#b9c5d4;--input:#fff}}
+html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#43536a;--input:#111c2d}}
+@media(prefers-color-scheme:dark){{html[data-theme=auto]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#43536a;--input:#111c2d}}}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);font:15px system-ui;color:var(--fg);display:grid;place-items:center;min-height:100vh}}
+.login{{width:min(390px,calc(100% - 28px));background:var(--card);padding:30px;border-radius:14px;box-shadow:0 12px 36px #17243b24}}
+input{{width:100%;padding:12px;margin:6px 0 16px;border:1px solid var(--border);border-radius:8px;background:var(--input);color:var(--fg)}}button{{width:100%;padding:12px;border:0;border-radius:8px;background:#1769aa;color:white}}
+.theme{{position:fixed;right:16px;top:16px;width:auto;padding:8px 12px}}.bad{{color:#e04444}}</style></head><body>
+<button type="button" class="theme" id="theme">主题</button><form class="login" method="post" action="/login">
 <h1>Simple Backup</h1><p>登录备份管理面板</p>{alert}<label>用户名</label>
 <input name="username" required autofocus autocomplete="username"><label>密码</label>
-<input name="password" type="password" required autocomplete="current-password"><button>登录</button>
-</form></body></html>"""
+<input name="password" type="password" required maxlength="256" autocomplete="current-password"><button>登录</button>
+</form><script>const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}};
+function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent='主题：'+tn[t]}}
+tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto')}};ts(document.documentElement.dataset.theme);</script></body></html>"""
 
     def save_task_form(self, form):
         task_id = form.get("id", "")
         old = self.task(task_id) if task_id else None
         raw = {key: form.get(key, "") for key in (
             "name", "remote_host", "remote_port", "remote_user", "remote_path", "ssh_key",
-            "backup_dir", "interval_days", "retention_limit", "transfer_threads",
+            "backup_dir", "interval_days", "retention_limit", "transfer_threads", "auth_method",
         )}
         raw["enabled"] = "enabled" in form
         raw["auto_install_dependencies"] = "auto_install_dependencies" in form
         task = validate_task(raw, task_id)
+        ssh_password = form.get("ssh_password", "")
+        if "\0" in ssh_password or len(ssh_password) > 512:
+            raise ValueError("SSH 密码无效")
+        if task["auth_method"] == "password" and not ssh_password and not self.task_password(task_id):
+            raise ValueError("选择密码登录时必须填写 SSH 密码")
         with self.lock:
             if old:
                 index = self.config["tasks"].index(old)
                 self.config["tasks"][index] = task
-                connection = ("remote_host", "remote_port", "remote_user", "ssh_key")
+                connection = ("remote_host", "remote_port", "remote_user", "ssh_key", "auth_method")
                 if any(old[k] != task[k] for k in connection):
                     self.task_state(task_id)["dependencies_ready"] = False
             else:
@@ -716,6 +787,11 @@ input{{width:100%;padding:12px;margin:6px 0 16px;border:1px solid #b9c5d4;border
             state["next_run"] = time.time() + task["interval_days"] * 86400
             self._save_config()
             self._save_state()
+            if task["auth_method"] == "password":
+                if ssh_password:
+                    self.set_task_password(task["id"], ssh_password)
+            else:
+                self.set_task_password(task["id"], "")
         return task
 
 class Handler(BaseHTTPRequestHandler):
@@ -733,6 +809,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Strict-Transport-Security", "max-age=31536000")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
@@ -823,18 +902,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_login(self, form):
         address = self.client_address[0]
-        if not self.app.login_allowed(address):
+        password = form.get("password", "")
+        with self.app.login_lock:
+            allowed = self.app.login_allowed(address)
+            username_ok = password_ok = False
+            if allowed:
+                username_ok = hmac.compare_digest(
+                    form.get("username", ""), self.app.config["admin_username"]
+                )
+                password_ok = verify_password(self.app.config, password)
+            valid = allowed and username_ok and password_ok
+            if allowed and not valid:
+                self.app.login_failed(address)
+            elif valid:
+                self.app.login_failures.pop(address, None)
+                self.app.account_failures.clear()
+                if int(self.app.config.get("password_iterations", 200_000)) < 600_000:
+                    self.app.config.update(password_fields(password))
+                    self.app._save_config()
+        if not allowed:
             self.send_html(self.app.login_html("失败次数过多，请 15 分钟后重试"), 429)
             return
-        username_ok = hmac.compare_digest(
-            form.get("username", ""), self.app.config["admin_username"]
-        )
-        if not username_ok or not verify_password(self.app.config, form.get("password", "")):
-            self.app.login_failed(address)
+        if not valid:
             time.sleep(0.5)
             self.send_html(self.app.login_html("用户名或密码错误"), 401)
             return
-        self.app.login_failures.pop(address, None)
         token = self.app.sign_session(self.app.config["admin_username"])
         cookie = f"sb_session={token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
         self.redirect("/", cookie)
@@ -852,6 +944,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("请先停止正在运行的任务")
             self.app.config["tasks"].remove(task)
             self.app.state["tasks"].pop(task["id"], None)
+            self.app.set_task_password(task["id"], "")
             self.app._save_config()
             self.app._save_state()
             self.redirect("/")

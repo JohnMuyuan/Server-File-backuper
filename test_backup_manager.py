@@ -46,6 +46,9 @@ class BackupManagerTest(unittest.TestCase):
             rsync = app.transfer_command({**task, "transfer_threads": 1}, root / "partial")
             self.assertEqual(rsync[0], "rsync")
             self.assertIn("--append-verify", rsync)
+            password_task = {**task, "auth_method": "password"}
+            app.set_task_password(task["id"], "remote secret")
+            self.assertIn("sshpass -e ssh", app.transfer_command(password_task, root / "partial")[2])
             self.assertEqual(human_size(3 * 1024 ** 3), "3.0 GB")
 
     def test_validation_migration_credentials_and_sessions(self):
@@ -69,11 +72,33 @@ class BackupManagerTest(unittest.TestCase):
             app = BackupApp(root / "data")
             initialize(app, "panel-user", "a-secure-password", 9443, "0.0.0.0", "/c", "/k")
             self.assertTrue(verify_password(app.config, "a-secure-password"))
+            self.assertEqual(app.config["password_iterations"], 600_000)
             token = app.sign_session("panel-user")
             self.assertTrue(app.verify_session(token))
             self.assertFalse(app.verify_session(token + "x"))
             saved = json.loads((root / "data" / "config.json").read_text(encoding="utf-8"))
             self.assertEqual((saved["admin_username"], saved["listen_port"]), ("panel-user", 9443))
+
+            form = {
+                "name": "密码服务器", "remote_host": "pw.example.com", "remote_port": "22",
+                "remote_user": "root", "remote_path": "/data", "ssh_key": "",
+                "backup_dir": str(root / "password-backups"), "interval_days": "3",
+                "retention_limit": "0", "transfer_threads": "4", "auth_method": "password",
+                "ssh_password": "only-in-secret-file", "enabled": "on",
+            }
+            created = app.save_task_form(form)
+            self.assertEqual(app.task_password(created["id"]), "only-in-secret-file")
+            config_text = (root / "data" / "config.json").read_text(encoding="utf-8")
+            self.assertNotIn("only-in-secret-file", config_text)
+
+            for _ in range(5):
+                app.login_failed("192.0.2.1")
+            self.assertFalse(app.login_allowed("192.0.2.1"))
+
+    def test_installer_does_not_overwrite_panel_port(self):
+        script = Path("install.sh").read_text(encoding="utf-8")
+        self.assertIn('firewall_port=$1', script)
+        self.assertNotIn('open_firewall() {\n    port=$1', script)
 
 
 if __name__ == "__main__":
