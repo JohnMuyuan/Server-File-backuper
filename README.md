@@ -1,6 +1,6 @@
 # Simple Backup
 
-给 Linux 服务器使用的可视化远程文件备份工具。网页填写远程服务器、目录、备份周期和保留份数，后台通过 SSH 自动备份。
+给 Linux 服务器使用的多任务远程备份面板。每个任务可独立设置源服务器、SSH 密钥、远程路径、本地目录、备份周期、保留份数和并行线程数；备份在后台运行。
 
 ## 一键安装
 
@@ -10,44 +10,54 @@
 bash <(curl -Ls https://raw.githubusercontent.com/JohnMuyuan/Server-File-backuper/main/install.sh)
 ```
 
-安装程序会询问公网 HTTPS 端口、管理用户名和管理密码，自动安装依赖、生成自签名 HTTPS 证书、配置开机启动，并为正在使用的 UFW 或 firewalld 开放端口。非交互安装可使用：
+安装器会要求填写公网 IPv4、面板端口、用户名和密码，自动安装依赖、配置服务和防火墙，并通过 Let’s Encrypt 申请可自动续期的短期 IP HTTPS 证书。浏览器不会再出现自签名证书警告。
+
+申请和续期证书时，公网 IPv4 必须直接指向这台服务器，且云安全组、防火墙和本机都要允许互联网访问 **TCP 80**。面板使用另外的自定义端口。TCP 80 被占用或处于 NAT/运营商封锁环境时，IP 证书无法签发，安装器会明确报错而不会退回不受信任证书。
+
+非交互安装：
 
 ```bash
-SB_NONINTERACTIVE=1 SB_PANEL_USER=admin SB_PANEL_PASSWORD='至少10位密码' SB_PANEL_PORT=8088 bash <(curl -Ls https://raw.githubusercontent.com/JohnMuyuan/Server-File-backuper/main/install.sh)
+SB_NONINTERACTIVE=1 \
+SB_PUBLIC_IP='203.0.113.10' \
+SB_PANEL_USER='admin' \
+SB_PANEL_PASSWORD='至少10位密码' \
+SB_PANEL_PORT='8088' \
+bash <(curl -Ls https://raw.githubusercontent.com/JohnMuyuan/Server-File-backuper/main/install.sh)
 ```
 
-完成后访问 `https://服务器公网IP:端口`。自签名证书第一次会触发浏览器警告，确认继续访问即可；连接仍经过 HTTPS 加密。云服务器还需要在厂商安全组中放行相同的 TCP 端口。
+完成后访问 `https://公网IP:面板端口`，使用网页内的登录界面进入。
 
-## 第一次设置
+## 创建备份任务
 
-1. 在保存备份的服务器执行 `ssh-keygen -t ed25519`。
-2. 执行 `ssh-copy-id -p 22 root@源服务器IP` 把公钥交给源服务器。
-3. 执行一次 `ssh root@源服务器IP`，确认免密码登录并接受主机指纹。
-4. 打开网页填写源服务器地址、目录、周期、保留份数和线程数，勾选自动备份并保存。
-5. 点击“立即备份”测试。
+1. 在备份服务器生成密钥：`ssh-keygen -t ed25519`。
+2. 把公钥交给源服务器：`ssh-copy-id -p 22 root@源服务器IP`。
+3. 在面板点击“新建任务”，填写源服务器、路径、周期等信息。
+4. 保持“首次连接自动安装依赖”勾选，然后点击“立即备份”测试。
 
-默认使用 4 线程：多个文件并行下载，单个大文件也会分段下载；中断后会保留续传状态。远端 SFTP 不兼容时，把线程数改为 `1`，程序会使用 rsync 兼容模式。
+程序首次执行任务时会用已提供的 SSH 密钥登录源服务器，检查并安装 rsync 和 OpenSSH SFTP。SSH 用户必须是 root，或拥有免密 `sudo -n` 权限；否则会在面板和 Telegram 中给出失败原因。程序使用 `StrictHostKeyChecking=accept-new` 自动记录首次主机指纹。
 
-每份完整备份位于 `/var/backups/simple-backup/时间_服务器/`，`.partial` 是断点续传暂存目录。磁盘剩余空间低于 3 GB 时会停止当前任务并暂停新任务，空间恢复后自动继续。
+默认 4 线程：多个文件可并行下载，大文件可分段下载；中断内容保存在每个任务自己的 `.partial-任务ID` 目录中，下次自动续传。线程数设为 1 时使用 rsync 兼容模式。
 
-## 管理菜单
-
-安装后执行：
-
-```bash
-simple-backup
-```
-
-菜单支持查看状态、启动、停止、重启、修改管理账号/密码/端口、更新、查看日志、重建 HTTPS 证书和卸载。也可直接执行 `simple-backup update`、`simple-backup status` 或 `simple-backup logs`。
-
-卸载默认只删除程序，不删除已有备份；面板配置和证书会再次询问是否删除。
+保留份数填 0 表示全部保留。设置为 10 时，在创建第 11 份之前先删除该任务最旧的一份。任务之间互不删除对方的备份。任一目标磁盘剩余空间低于 3 GB 时，程序会停止所有正在运行的备份、暂停新备份并发送 Telegram 通知。
 
 ## Telegram
 
-向 `@BotFather` 发送 `/newbot` 创建机器人，把 Token 填进网页；给机器人发一条消息，再访问 `https://api.telegram.org/bot你的Token/getUpdates`，从结果中找到 `chat.id` 填入网页。
+在面板“设置”中填写 Bot Token 和 Chat ID。只有这个 Chat ID 可以控制任务：
 
-支持命令：`/backup`、`/stop`、`/status`、`/list`、`/delete 备份名称`。只有设置中的 Chat ID 可以控制。
+```text
+/tasks
+/backup 任务ID
+/stop 任务ID
+/stop all
+/status 任务ID
+/list 任务ID
+/delete 任务ID 备份文件名
+```
 
-## 支持范围
+只有一个任务时，部分命令可省略任务 ID。通知包含任务开始、成功、失败、容量不足和旧备份删除；成功通知包含备份文件名、大小、时间和剩余容量。
 
-安装器支持 apt、dnf、yum、zypper、pacman、apk，以及 systemd、OpenRC 和常见 SysV init。需要源服务器提供 SSH/SFTP 服务。
+## 管理与支持范围
+
+安装后执行 `simple-backup` 可查看状态、启动、停止、重启、修改面板账号/端口、更新、查看日志、重新申请 IP 证书或卸载。也可直接运行 `simple-backup update`。
+
+安装器支持 apt、dnf、yum、zypper、pacman、apk，以及 systemd、OpenRC 和常见 SysV init。旧版单任务配置在升级后会自动迁移为第一个任务。卸载默认保留已有备份文件。
