@@ -136,6 +136,7 @@ class BackupManagerTest(unittest.TestCase):
         script = Path("install.sh").read_text(encoding="utf-8")
         self.assertIn('firewall_port=$1', script)
         self.assertNotIn('open_firewall() {\n    port=$1', script)
+        self.assertIn('socket.SO_REUSEADDR', script)
         self.assertIn('verify_panel_tls()', script)
         self.assertIn('tar zstd', script)
 

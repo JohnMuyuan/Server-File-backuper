@@ -90,6 +90,7 @@ port_free() {
     python3 - "$1" <<'PY'
 import socket, sys
 s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(("0.0.0.0", int(sys.argv[1])))
 except OSError:
