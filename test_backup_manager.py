@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import time
@@ -46,9 +47,15 @@ class BackupManagerTest(unittest.TestCase):
             archive.write_bytes(b"archive")
             self.assertIn(archive, app.backups(task))
 
-            lftp = app.transfer_command(task, root / "partial")
+            lftp = app.transfer_command(task, root / "partial", 100)
             self.assertEqual(lftp[0], "lftp")
-            self.assertIn("--parallel=2 --use-pget-n=2", lftp[2])
+            self.assertIn("--parallel=4", lftp[2])
+            self.assertNotIn("--use-pget-n", lftp[2])
+            self.assertIn("mirror:parallel-directories true", lftp[2])
+            large = app.transfer_command(task, root / "partial", 1)
+            self.assertIn("--parallel=1 --use-pget-n=4", large[2])
+            mixed = app.transfer_command(task, root / "partial", 2)
+            self.assertIn("--parallel=2 --use-pget-n=2", mixed[2])
             rsync = app.transfer_command({**task, "transfer_threads": 1}, root / "partial")
             self.assertEqual(rsync[0], "rsync")
             self.assertIn("--append-verify", rsync)
@@ -189,6 +196,16 @@ class BackupManagerTest(unittest.TestCase):
             self.assertGreater(job["speed_bps"], 0)
             self.assertEqual(job["slots"][0]["name"], "large.bin")
 
+            job.update(
+                _sample_time=time.time() - 1, _sample_total=512,
+                _file_samples={"large.bin": (512, time.time() - 1)},
+            )
+            tiny = staging / "new-tiny.txt"
+            tiny.write_bytes(b"tiny")
+            os.utime(tiny, (1, 1))
+            app.sample_transfer(staging, progress_task, job)
+            self.assertIn("new-tiny.txt", [slot["name"] for slot in job["slots"]])
+
             app.config["tasks"].append(progress_task)
             app.log("只属于这个任务", task_id=progress_task["id"])
             self.assertIn("只属于这个任务", app.read_task_log(progress_task["id"]))
@@ -196,6 +213,39 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("活跃传输槽位", detail)
             self.assertIn("该任务的全部日志", detail)
             self.assertIn("☀", detail)
+
+    def test_pause_discard_and_restart_resume(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = sample_task(root / "backups")
+            app = BackupApp(root / "data")
+            app.config["tasks"] = [task]
+            partial = Path(task["backup_dir"]) / f".partial-{task['id']}"
+            partial.mkdir(parents=True)
+            (partial / "part.bin").write_bytes(b"partial")
+
+            app.task_state(task["id"])["last_result"] = "运行中"
+            resumed = []
+            app.start_backup = lambda task_id, source: (resumed.append((task_id, source)) or True, "ok")
+            self.assertEqual(app.resume_interrupted(), 1)
+            self.assertEqual(resumed[0][0], task["id"])
+
+            app.task_state(task["id"])["last_result"] = "已暂停"
+            self.assertIn("继续备份", app.dashboard_html(app.sign_session("admin")))
+            event = threading.Event()
+            app.jobs[task["id"]] = {"stop": event, "discard_partial": False}
+            running_page = app.dashboard_html(app.sign_session("admin"))
+            self.assertIn("临时暂停", running_page)
+            self.assertIn("停止并清除", running_page)
+            ok, _ = app.stop_backup(task["id"], True)
+            self.assertTrue(ok)
+            self.assertTrue(event.is_set())
+            self.assertTrue(app.jobs[task["id"]]["discard_partial"])
+            history = Path(task["backup_dir"]) / f"20260719-010101_{backup_prefix(task)}.tar.zst"
+            history.write_bytes(b"history")
+            app.clear_partial(task)
+            self.assertFalse(partial.exists())
+            self.assertTrue(history.exists())
 
     def test_installer_does_not_overwrite_panel_port(self):
         script = Path("install.sh").read_text(encoding="utf-8")

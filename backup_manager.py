@@ -470,7 +470,12 @@ class BackupApp:
     def lftp_quote(value):
         return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
-    def transfer_command(self, task, staging):
+    @staticmethod
+    def transfer_layout(threads, file_count=0):
+        parallel = min(threads, max(1, file_count)) if file_count else threads
+        return parallel, max(1, threads // parallel)
+
+    def transfer_command(self, task, staging, file_count=0):
         destination = str(staging) + "/"
         _, ssh = self.ssh_program(task)
         if task["transfer_threads"] == 1:
@@ -481,14 +486,15 @@ class BackupApp:
                 destination,
             ]
         threads = task["transfer_threads"]
-        parallel = max(1, int(threads ** 0.5))
-        segments = max(2, threads // parallel)
+        parallel, segments = self.transfer_layout(threads, file_count)
+        pget = f" --use-pget-n={segments}" if segments > 1 else ""
         ssh += " -a -x"
         script = (
             f"set sftp:connect-program {self.lftp_quote(ssh)}; "
             "set net:timeout 20; set net:max-retries 5; set net:reconnect-interval-base 3; "
+            "set mirror:parallel-directories true; "
             f"open {self.lftp_quote('sftp://' + task['remote_user'] + '@' + task['remote_host'])}; "
-            f"mirror --verbose --continue --delete --parallel={parallel} --use-pget-n={segments} "
+            f"mirror --verbose --continue --delete --parallel={parallel}{pget} "
             f"{self.lftp_quote(task['remote_path'])} {self.lftp_quote(destination)}"
         )
         return ["lftp", "-e", script + "; bye"]
@@ -555,12 +561,28 @@ class BackupApp:
         path.mkdir(parents=True, exist_ok=True)
         return shutil.disk_usage(path).free
 
-    def stop_all(self, reason="用户要求停止"):
+    def stop_all(self, reason="用户要求停止", discard=False):
         with self.lock:
             jobs = list(self.jobs.values())
         for job in jobs:
             job["reason"] = reason
+            job["discard_partial"] = discard
             job["stop"].set()
+
+    def stop_backup(self, task_id, discard=False, source="网页"):
+        job = self.jobs.get(task_id)
+        if not job:
+            return False, "任务当前未运行"
+        job["discard_partial"] = discard
+        job["reason"] = f"{source}{'停止并清除断点' if discard else '临时暂停'}"
+        job["stop"].set()
+        return True, "已发送停止指令" if discard else "已发送暂停指令"
+
+    @staticmethod
+    def clear_partial(task):
+        root = Path(task["backup_dir"])
+        shutil.rmtree(root / f".partial-{task['id']}", ignore_errors=True)
+        (root / f".archive-{task['id']}.tar.zst").unlink(missing_ok=True)
 
     def disk_guard(self, task):
         free = self.free_space(task)
@@ -580,20 +602,23 @@ class BackupApp:
         prefix, _ = self.ssh_program(task)
         path = shlex.quote(task["remote_path"])
         remote = (
-            f"if v=$(du -sb -- {path} 2>/dev/null); then set -- $v; printf '%s\\n' \"$1\"; "
-            f"elif v=$(du -sk -- {path} 2>/dev/null); then set -- $v; printf '%s\\n' \"$(($1 * 1024))\"; "
-            "else exit 1; fi"
+            f"if v=$(du -sb -- {path} 2>/dev/null); then set -- $v; size=$1; "
+            f"elif v=$(du -sk -- {path} 2>/dev/null); then set -- $v; size=$(($1 * 1024)); "
+            f"else exit 1; fi; count=$(find {path} -type f -print 2>/dev/null | wc -l); "
+            "printf '%s %s\\n' \"$size\" \"$count\""
         )
-        job["phase"] = "正在统计远端大小"
+        job["phase"] = "正在统计远端文件"
         code, output = self.execute(
             [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", remote],
             task, job,
         )
-        values = re.findall(r"(?m)^\s*(\d+)\s*$", output)
+        values = re.findall(r"(?m)^\s*(\d+)\s+(\d+)\s*$", output)
         if code or not values:
             self.log("无法取得远端总大小，将继续下载并显示已传输量", "WARN", task["id"])
             return 0
-        return int(values[-1])
+        size, file_count = map(int, values[-1])
+        job["remote_files"] = file_count
+        return size
 
     def sample_transfer(self, staging, task, job):
         now = time.time()
@@ -623,7 +648,7 @@ class BackupApp:
         previous_files = job.get("_file_samples", {})
         candidates, current_files = [], {}
         for name, size, modified in files:
-            old_size = previous_files.get(name, (size, now))[0]
+            old_size = previous_files.get(name, (0, now))[0]
             speed = max(0, size - old_size) / elapsed
             current_files[name] = (size, now)
             if speed > 0 or now - modified < 5:
@@ -750,11 +775,18 @@ class BackupApp:
             staging.mkdir(exist_ok=True)
             os.chmod(staging, 0o700)
             job["total_bytes"] = self.remote_size(task, job)
+            parallel, segments = self.transfer_layout(task["transfer_threads"], job.get("remote_files", 0))
+            job.update(parallel_files=parallel, segments_per_file=segments)
             job["phase"] = "正在下载"
             job["progress"] = 0
             job["_sample_time"] = time.time()
-            job["_sample_total"] = directory_size(staging)
-            code, output = self.execute(self.transfer_command(task, staging), task, job, monitor_path=staging)
+            job["_sample_total"] = 0
+            self.sample_transfer(staging, task, job)
+            job.update(speed_bps=0, slots=[])
+            code, output = self.execute(
+                self.transfer_command(task, staging, job.get("remote_files", 0)),
+                task, job, monitor_path=staging,
+            )
         else:
             # ponytail: logical dumps restart on retry; add engine-specific incremental backup only when requested.
             shutil.rmtree(staging, ignore_errors=True)
@@ -796,6 +828,8 @@ class BackupApp:
                 "stop": threading.Event(), "process": None, "progress": 0,
                 "reason": "", "next_progress_notice": 25, "phase": "正在下载",
                 "speed_bps": 0, "transferred_bytes": 0, "total_bytes": 0, "slots": [],
+                "remote_files": 0, "parallel_files": 1, "segments_per_file": 1,
+                "discard_partial": False,
             }
             self.jobs[task_id] = job
         threading.Thread(target=self._backup_worker, args=(dict(task), job, source), daemon=True).start()
@@ -828,9 +862,15 @@ class BackupApp:
                         break
                     time.sleep(min(30, attempt * 5))
             if job["stop"].is_set():
-                state.update(last_result="已停止", last_error=error)
+                discarded = job.get("discard_partial", False)
+                if discarded:
+                    self.clear_partial(task)
+                state.update(last_result="已停止" if discarded else "已暂停", last_error=error)
                 self._save_state()
-                self.notify(f"备份已停止：{task['name']}\n原因：{error}", task["id"])
+                self.notify(
+                    f"备份{'已停止并清除断点' if discarded else '已暂停，断点已保留'}：{task['name']}\n原因：{error}",
+                    task["id"],
+                )
                 return
             state.update(last_result="失败", last_error=error)
             if source == "定时":
@@ -840,6 +880,15 @@ class BackupApp:
         finally:
             with self.lock:
                 self.jobs.pop(task["id"], None)
+
+    def resume_interrupted(self):
+        resumed = 0
+        for task in self.config["tasks"]:
+            if self.task_state(task["id"]).get("last_result") != "运行中":
+                continue
+            ok, _ = self.start_backup(task["id"], "服务重启后自动续传")
+            resumed += int(ok)
+        return resumed
 
     def scheduler_loop(self):
         last_telegram = 0
@@ -887,7 +936,8 @@ class BackupApp:
         if command in ("/start", "/help"):
             self.notify(
                 "备份管理命令：\n/tasks 查看任务\n/backup 任务ID 开始\n"
-                "/stop 任务ID（或 all）停止\n/status [任务ID]\n/list 任务ID\n"
+                "/stop 任务ID（或 all）暂停并保留断点\n"
+                "/discard 任务ID（或 all）停止并清除断点\n/status [任务ID]\n/list 任务ID\n"
                 "/delete 任务ID 备份文件名"
             )
         elif command == "/tasks":
@@ -902,15 +952,20 @@ class BackupApp:
             self.notify(message)
         elif command == "/stop":
             if argument.strip().lower() == "all":
-                self.stop_all("Telegram 强制停止")
-                self.notify("已要求停止所有正在运行的备份")
+                self.stop_all("Telegram 临时暂停")
+                self.notify("已要求暂停所有正在运行的备份，断点将保留")
             else:
                 task = self.resolve_task(argument)
-                job = self.jobs.get(task["id"]) if task else None
-                if job:
-                    job["reason"] = "Telegram 强制停止"
-                    job["stop"].set()
-                self.notify("已发送停止指令" if job else "任务不存在或当前未运行")
+                ok, message = self.stop_backup(task["id"], False, "Telegram") if task else (False, "任务不存在或名称不唯一")
+                self.notify(message)
+        elif command == "/discard":
+            if argument.strip().lower() == "all":
+                self.stop_all("Telegram 停止并清除断点", True)
+                self.notify("已要求停止所有正在运行的备份并清除断点")
+            else:
+                task = self.resolve_task(argument)
+                ok, message = self.stop_backup(task["id"], True, "Telegram") if task else (False, "任务不存在或名称不唯一")
+                self.notify(message)
         elif command == "/status":
             task = self.resolve_task(argument)
             if task:
@@ -1077,11 +1132,15 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
             )
             next_run = datetime.fromtimestamp(state["next_run"]).strftime("%Y-%m-%d %H:%M") if state.get("next_run") else "待安排"
             error = f"<p class='bad'>原因：{self.esc(state.get('last_error'))}</p>" if state.get("last_error") else ""
-            action = (
-                f"<form class='inline' method='post' action='/backup/stop'><input type='hidden' name='id' value='{task['id']}'><button class='danger'>强制停止</button></form>"
-                if job else
-                f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task['id']}'><button>立即备份</button></form>"
-            )
+            partial = Path(task["backup_dir"]) / f".partial-{task['id']}"
+            if job:
+                action = (
+                    f"<form class='inline' method='post' action='/backup/pause'><input type='hidden' name='id' value='{task['id']}'><button class='secondary'>临时暂停</button></form>"
+                    f"<form class='inline' method='post' action='/backup/stop' onsubmit=\"return confirm('停止后会清除本次已下载的数据，且无法断点续传。确定？')\"><input type='hidden' name='id' value='{task['id']}'><button class='danger'>停止并清除</button></form>"
+                )
+            else:
+                label = "继续备份" if partial.exists() or state.get("last_result") == "已暂停" else "立即备份"
+                action = f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task['id']}'><button>{label}</button></form>"
             if task["source_type"] == "files":
                 source = self.esc(task["remote_path"])
             else:
@@ -1106,15 +1165,16 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
         progress = job.get("progress", 0) if job else 0
         transferred = job.get("transferred_bytes", 0) if job else 0
         total = job.get("total_bytes", 0) if job else 0
+        plan = f"并行文件 {job.get('parallel_files', 1)} 个 · 每个文件 {job.get('segments_per_file', 1)} 段" if job else "等待任务开始"
         body = f"""<section class="card"><div class="row"><div style="margin-right:auto"><h1>{self.esc(task['name'])}</h1>
 <p class="muted">任务 ID {task_id} · {self.esc(task['remote_user'])}@{self.esc(task['remote_host'])}</p></div><a class="btn secondary" href="/task?id={task_id}">编辑</a></div>
 <h2 id="detail-phase">{self.esc(phase)}</h2><div class="progress"><span id="detail-bar" style="width:{progress}%"></span></div>
-<p id="detail-summary">{progress}% · {human_size(transferred)} / {human_size(total) if total else '总大小暂未取得'}</p>
+<p id="detail-summary">{progress}% · {human_size(transferred)} / {human_size(total) if total else '总大小暂未取得'}</p><p class="muted" id="detail-plan">并发策略：{plan}</p>
 <p class="muted">多线程模式下显示活跃传输槽位。槽位速度和已传输量来自本地断点文件的实际增长；百分比为整个任务的总体进度。</p></section>
 <section class="card"><h2>活跃传输槽位</h2><div style="overflow:auto"><table><thead><tr><th>槽位</th><th>当前文件</th><th>速度</th><th>已传输</th><th>任务进度</th></tr></thead><tbody id="slot-rows"><tr><td colspan="5" class="muted">暂无活跃传输</td></tr></tbody></table></div></section>
 <section class="card"><div class="row"><h2 style="margin-right:auto">该任务的全部日志</h2><a class="btn secondary" href="/logs">全部应用日志</a></div><pre id="task-log">{self.esc(self.read_task_log(task_id))}</pre></section>
 <script>const taskId={json.dumps(task_id)};function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}
-async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow();['#'+s.slot,s.name,fmt(s.speed_bps)+'/s',fmt(s.bytes),s.progress+'%'].forEach(v=>{{let td=tr.insertCell();td.textContent=v}})}})}}
+async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');document.getElementById('detail-plan').textContent='并发策略：并行文件 '+x.parallel_files+' 个 · 每个文件 '+x.segments_per_file+' 段';if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow();['#'+s.slot,s.name,fmt(s.speed_bps)+'/s',fmt(s.bytes),s.progress+'%'].forEach(v=>{{let td=tr.insertCell();td.textContent=v}})}})}}
 async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURIComponent(taskId));document.getElementById('task-log').textContent=await r.text()}}detail();setInterval(detail,2000);setInterval(taskLog,5000);</script>"""
         return self.page("任务详情", body, token)
 
@@ -1380,6 +1440,8 @@ class Handler(BaseHTTPRequestHandler):
                     "transferred_bytes": job.get("transferred_bytes", 0),
                     "total_bytes": job.get("total_bytes", 0),
                     "slots": job.get("slots", []),
+                    "parallel_files": job.get("parallel_files", 1),
+                    "segments_per_file": job.get("segments_per_file", 1),
                 }
                 for task_id, job in list(self.app.jobs.items()) if self.app.task(task_id)
             ]
@@ -1458,16 +1520,20 @@ class Handler(BaseHTTPRequestHandler):
             self.app._save_state()
             self.redirect("/")
         elif path == "/backup/start":
-            ok, message = self.app.start_backup(form.get("id", ""), "网页")
+            task_id = form.get("id", "")
+            task = self.app.task(task_id)
+            partial = Path(task["backup_dir"]) / f".partial-{task_id}" if task else None
+            source = "网页断点续传" if partial and partial.exists() else "网页"
+            ok, message = self.app.start_backup(task_id, source)
             if not ok:
                 raise ValueError(message)
             self.redirect("/")
-        elif path == "/backup/stop":
-            job = self.app.jobs.get(form.get("id", ""))
-            if not job:
-                raise ValueError("任务当前未运行")
-            job["reason"] = "网页强制停止"
-            job["stop"].set()
+        elif path in ("/backup/pause", "/backup/stop"):
+            ok, message = self.app.stop_backup(
+                form.get("id", ""), path == "/backup/stop", "网页"
+            )
+            if not ok:
+                raise ValueError(message)
             self.redirect("/")
         elif path == "/backup/delete":
             task = self.app.task(form.get("id", ""))
@@ -1540,8 +1606,11 @@ def serve(app):
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
+    resumed = app.resume_interrupted()
     threading.Thread(target=app.scheduler_loop, daemon=True).start()
     app.log(f"服务启动：HTTPS {app.config['listen_host']}:{app.config['listen_port']}")
+    if resumed:
+        app.log(f"服务重启后已自动恢复 {resumed} 个中断任务")
     try:
         server.serve_forever()
     finally:
