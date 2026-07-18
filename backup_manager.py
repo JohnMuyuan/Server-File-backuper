@@ -327,8 +327,9 @@ class BackupApp:
         self.account_failures.append(now)
         self.log(f"登录失败：来源 {address}", "WARN")
 
-    def log(self, message, level="INFO"):
-        line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {str(message).replace(chr(13), ' ').replace(chr(10), ' | ')}\n"
+    def log(self, message, level="INFO", task_id=""):
+        task_tag = f" [task:{task_id}]" if task_id else ""
+        line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}]{task_tag} {str(message).replace(chr(13), ' ').replace(chr(10), ' | ')}\n"
         with self.lock:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             if self.log_path.exists() and self.log_path.stat().st_size > 5 * 1024 * 1024:
@@ -348,6 +349,10 @@ class BackupApp:
         except OSError:
             return "暂无日志"
 
+    def read_task_log(self, task_id):
+        marker = f"[task:{task_id}]"
+        return "".join(line for line in self.read_log(None).splitlines(True) if marker in line) or "该任务暂无日志"
+
     @staticmethod
     def send_telegram(token, chat_id, message):
         try:
@@ -359,8 +364,8 @@ class BackupApp:
         except Exception as exc:
             return False, str(exc)
 
-    def notify(self, message):
-        self.log(message)
+    def notify(self, message, task_id=""):
+        self.log(message, task_id=task_id)
         token = self.config.get("telegram_bot_token")
         chat_id = self.config.get("telegram_chat_id")
         if not token or not chat_id:
@@ -445,13 +450,87 @@ class BackupApp:
             if not self.state["low_disks"].get(key):
                 self.state["low_disks"][key] = True
                 self._save_state()
-                self.notify(f"容量不足：{task['name']} 的备份盘仅剩 {human_size(free)}，已停止所有备份和自动备份。")
+                self.notify(f"容量不足：{task['name']} 的备份盘仅剩 {human_size(free)}，已停止所有备份和自动备份。", task["id"])
             return False
         if self.state["low_disks"].pop(key, None):
             self._save_state()
         return True
 
-    def execute(self, command, task, job, stdin=None):
+    def remote_size(self, task, job):
+        prefix, _ = self.ssh_program(task)
+        path = shlex.quote(task["remote_path"])
+        remote = (
+            f"if v=$(du -sb -- {path} 2>/dev/null); then set -- $v; printf '%s\\n' \"$1\"; "
+            f"elif v=$(du -sk -- {path} 2>/dev/null); then set -- $v; printf '%s\\n' \"$(($1 * 1024))\"; "
+            "else exit 1; fi"
+        )
+        job["phase"] = "正在统计远端大小"
+        code, output = self.execute(
+            [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", remote],
+            task, job,
+        )
+        values = re.findall(r"(?m)^\s*(\d+)\s*$", output)
+        if code or not values:
+            self.log("无法取得远端总大小，将继续下载并显示已传输量", "WARN", task["id"])
+            return 0
+        return int(values[-1])
+
+    def sample_transfer(self, staging, task, job):
+        now = time.time()
+        total, files = 0, []
+        try:
+            for root, _, names in os.walk(staging):
+                for name in names:
+                    path = os.path.join(root, name)
+                    try:
+                        stat = os.stat(path, follow_symlinks=False)
+                        total += stat.st_size
+                        files.append((os.path.relpath(path, staging), stat.st_size, stat.st_mtime))
+                    except (FileNotFoundError, PermissionError):
+                        pass
+        except OSError:
+            return
+
+        previous_time = job.get("_sample_time", now)
+        elapsed = max(0.001, now - previous_time)
+        previous_total = job.get("_sample_total", total)
+        job["speed_bps"] = max(0, total - previous_total) / elapsed
+        job["transferred_bytes"] = total
+        total_bytes = job.get("total_bytes", 0)
+        if total_bytes:
+            job["progress"] = min(99, int(total * 100 / total_bytes))
+
+        previous_files = job.get("_file_samples", {})
+        candidates, current_files = [], {}
+        for name, size, modified in files:
+            old_size = previous_files.get(name, (size, now))[0]
+            speed = max(0, size - old_size) / elapsed
+            current_files[name] = (size, now)
+            if speed > 0 or now - modified < 5:
+                candidates.append((speed, modified, name, size))
+        candidates.sort(reverse=True)
+        job["slots"] = [
+            {
+                "slot": index + 1, "name": name, "bytes": size,
+                "speed_bps": speed, "progress": job.get("progress", 0),
+            }
+            for index, (speed, _, name, size) in enumerate(candidates[:task["transfer_threads"]])
+        ]
+        job["_sample_time"] = now
+        job["_sample_total"] = total
+        job["_file_samples"] = current_files
+
+        progress = job.get("progress", 0)
+        if total_bytes and progress >= job.get("next_progress_notice", 25) and progress < 100:
+            milestone = progress // 25 * 25
+            job["next_progress_notice"] = milestone + 25
+            threading.Thread(
+                target=self.notify,
+                args=(f"备份进度：{task['name']} 已完成约 {milestone}%", task["id"]),
+                daemon=True,
+            ).start()
+
+    def execute(self, command, task, job, stdin=None, monitor_path=None):
         environment = None
         if task["auth_method"] == "password":
             environment = os.environ.copy()
@@ -471,7 +550,7 @@ class BackupApp:
             process.stdin.close()
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
-        output, last_check = [], 0
+        output, last_check, last_sample = [], 0, 0
         while process.poll() is None:
             if job["stop"].is_set():
                 try:
@@ -482,6 +561,9 @@ class BackupApp:
             if now - last_check >= 5:
                 last_check = now
                 self.disk_guard(task)
+            if monitor_path is not None and now - last_sample >= 2:
+                last_sample = now
+                self.sample_transfer(monitor_path, task, job)
             for key, _ in selector.select(1):
                 line = key.fileobj.readline()
                 if not line:
@@ -489,20 +571,16 @@ class BackupApp:
                 output.append(line)
                 if len(output) > 120:
                     del output[:40]
-                match = re.search(r"(\d{1,3})%", line)
-                if match:
-                    job["progress"] = min(100, int(match.group(1)))
-                    if job["progress"] >= job.get("next_progress_notice", 25) and job["progress"] < 100:
-                        milestone = job["progress"] // 25 * 25
-                        job["next_progress_notice"] = milestone + 25
-                        threading.Thread(
-                            target=self.notify,
-                            args=(f"备份进度：{task['name']} 已完成约 {milestone}%",),
-                            daemon=True,
-                        ).start()
+                self.log(f"{command[0]}: {line.rstrip()}", "PROCESS", task["id"])
         rest = process.stdout.read()
         if rest:
             output.append(rest)
+            for line in rest.splitlines():
+                self.log(f"{command[0]}: {line}", "PROCESS", task["id"])
+        if monitor_path is not None:
+            self.sample_transfer(monitor_path, task, job)
+            if process.returncode == 0:
+                job["progress"] = 100
         job["process"] = None
         return process.returncode, "".join(output)[-6000:]
 
@@ -529,7 +607,9 @@ class BackupApp:
         while len(items) >= limit:
             oldest = items.pop(0)
             self.delete_backup(oldest)
-            self.notify(f"已删除旧备份：{task['name']} / {oldest.name}")
+            message = f"已删除旧备份：{task['name']} / {oldest.name}"
+            self.log(message, task_id=task["id"])
+            self.notify(message)
 
     @staticmethod
     def delete_backup(path):
@@ -547,7 +627,12 @@ class BackupApp:
         root.mkdir(parents=True, exist_ok=True)
         staging = root / f".partial-{task['id']}"
         staging.mkdir(exist_ok=True)
-        code, output = self.execute(self.transfer_command(task, staging), task, job)
+        job["total_bytes"] = self.remote_size(task, job)
+        job["phase"] = "正在下载"
+        job["progress"] = 0
+        job["_sample_time"] = time.time()
+        job["_sample_total"] = directory_size(staging)
+        code, output = self.execute(self.transfer_command(task, staging), task, job, monitor_path=staging)
         if job["stop"].is_set():
             raise RuntimeError(job.get("reason") or "备份已停止")
         if code:
@@ -580,6 +665,7 @@ class BackupApp:
             job = {
                 "stop": threading.Event(), "process": None, "progress": 0,
                 "reason": "", "next_progress_notice": 25, "phase": "正在下载",
+                "speed_bps": 0, "transferred_bytes": 0, "total_bytes": 0, "slots": [],
             }
             self.jobs[task_id] = job
         threading.Thread(target=self._backup_worker, args=(dict(task), job, source), daemon=True).start()
@@ -589,7 +675,7 @@ class BackupApp:
         state = self.task_state(task["id"])
         state.update(last_result="运行中", last_error="")
         self._save_state()
-        self.notify(f"备份任务开始：{task['name']}（{source}）")
+        self.notify(f"备份任务开始：{task['name']}（{source}）", task["id"])
         error = ""
         try:
             for attempt in range(1, 7):
@@ -601,24 +687,26 @@ class BackupApp:
                     self._save_state()
                     self.notify(
                         f"备份成功：{task['name']}\n文件名：{final.name}\n大小：{human_size(size)}\n"
-                        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n剩余容量：{human_size(free)}"
+                        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n剩余容量：{human_size(free)}",
+                        task["id"],
                     )
                     return
                 except Exception as exc:
                     error = str(exc)
+                    self.log(f"第 {attempt} 次备份尝试失败：{error}", "ERROR", task["id"])
                     if job["stop"].is_set() or attempt == 6:
                         break
                     time.sleep(min(30, attempt * 5))
             if job["stop"].is_set():
                 state.update(last_result="已停止", last_error=error)
                 self._save_state()
-                self.notify(f"备份已停止：{task['name']}\n原因：{error}")
+                self.notify(f"备份已停止：{task['name']}\n原因：{error}", task["id"])
                 return
             state.update(last_result="失败", last_error=error)
             if source == "定时":
                 state["next_run"] = self.next_scheduled(task, state, time.time() + 1)
             self._save_state()
-            self.notify(f"备份失败：{task['name']}\n已连续失败 6 次并停止。\n原因：{error}")
+            self.notify(f"备份失败：{task['name']}\n已连续失败 6 次并停止。\n原因：{error}", task["id"])
         finally:
             with self.lock:
                 self.jobs.pop(task["id"], None)
@@ -638,7 +726,7 @@ class BackupApp:
                     elif state["next_run"] <= now and self.disk_guard(task):
                         self.start_backup(task["id"], "定时")
                 except Exception as exc:
-                    self.log(f"调度任务 {task.get('name', task.get('id'))} 出错：{exc}", "ERROR")
+                    self.log(f"调度任务 {task.get('name', task.get('id'))} 出错：{exc}", "ERROR", task.get("id", ""))
             if now - last_telegram >= 3:
                 last_telegram = now
                 self.poll_telegram()
@@ -740,25 +828,25 @@ html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#33445d
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}}
 header{{background:#17243b;color:white;padding:16px}}nav{{max-width:1100px;margin:auto;display:flex;gap:18px;align-items:center;flex-wrap:wrap}}
 nav b{{font-size:20px;margin-right:auto}}a{{color:#1769aa;text-decoration:none}}nav a{{color:white}}
-main{{max-width:1100px;margin:24px auto;padding:0 14px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px}}
-.card{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;box-shadow:0 3px 12px #2030400d}}
+main{{max-width:1100px;margin:28px auto;padding:0 14px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:24px}}
+.card{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;box-shadow:0 3px 12px #2030400d}}main>.card{{margin-top:24px}}
 .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.muted{{color:var(--muted)}}.ok{{color:#08783f}}.bad{{color:#e04444}}
 label{{display:block;margin:12px 0 4px;font-weight:600}}input,select{{width:100%;padding:10px;border:1px solid var(--border);border-radius:7px;background:var(--input);color:var(--fg)}}
 input[type=checkbox]{{width:auto}}button,.btn{{border:0;border-radius:7px;padding:9px 14px;background:#1769aa;color:white;cursor:pointer}}
 .danger{{background:#b42318}}.secondary{{background:#667085}}form.inline{{display:inline}}small{{line-height:1.5}}
-.theme-icon{{background:transparent;padding:5px;color:#c9d5e7;display:grid;place-items:center}}.theme-icon:hover{{color:white;background:#ffffff18}}
-.theme-icon svg{{width:20px;height:20px}}.time-row{{display:flex;gap:8px;margin:6px 0}}.time-row input{{margin:0}}.time-row button{{padding:6px 11px}}
+.theme-icon{{background:transparent;padding:5px;color:#c9d5e7;display:grid;place-items:center;font-size:21px;line-height:1;min-width:32px;transition:transform .18s,color .18s}}.theme-icon:hover{{color:white;background:#ffffff18}}.theme-icon.changed{{transform:rotate(25deg) scale(1.15)}}
+.time-row{{display:flex;gap:8px;margin:6px 0}}.time-row input{{margin:0}}.time-row button{{padding:6px 11px}}
 .donut{{width:150px;height:150px;border-radius:50%;display:grid;place-items:center;margin:auto}}.donut:after{{content:'';width:105px;height:105px;border-radius:50%;background:var(--card)}}
 .disk-wrap{{position:relative;text-align:center}}.disk-tip{{display:none;position:absolute;z-index:2;left:50%;transform:translateX(-50%);background:#111827;color:white;padding:10px;border-radius:7px;min-width:240px;white-space:pre-line}}.disk-wrap:hover .disk-tip{{display:block}}
 pre{{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--border);padding:12px;border-radius:8px;max-height:430px;overflow:auto}}
+.progress{{height:12px;background:var(--border);border-radius:999px;overflow:hidden}}.progress>span{{display:block;height:100%;background:#1769aa;transition:width .3s}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;text-align:left;border-bottom:1px solid var(--border)}}.metric{{font-size:26px;margin:8px 0}}
 </style></head><body><header><nav><b>Simple Backup</b><a href="/">首页</a><a href="/tasks">任务</a>
-<a href="/task">新建任务</a><a href="/logs">日志</a><a href="/settings">设置</a><button type="button" class="theme-icon" id="theme" aria-label="切换主题" title="切换主题">
-<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20V2Zm0 18a8 8 0 0 1 0-16v16Z"/></svg></button><a href="/logout">退出</a></nav></header>
+<a href="/task">新建任务</a><a href="/logs">日志</a><a href="/settings">设置</a><button type="button" class="theme-icon" id="theme" aria-label="切换主题" title="切换主题">◐</button><a href="/logout">退出</a></nav></header>
 <main>{body}</main><script>document.querySelectorAll('form').forEach(f=>{{
 if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value='{csrf}';f.appendChild(i)}}}});
-const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}};
-function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title)}}
-tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto')}};ts(document.documentElement.dataset.theme);
+const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}},ti={{auto:'◐',light:'☀',dark:'☾'}};
+function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent=ti[t];tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title);if(feedback){{tb.classList.remove('changed');void tb.offsetWidth;tb.classList.add('changed');setTimeout(()=>tb.classList.remove('changed'),220)}}}}
+tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);
 const am=document.getElementById('auth-method'),ka=document.getElementById('key-auth'),pa=document.getElementById('password-auth');
 function authUI(){{if(!am)return;ka.hidden=am.value!=='key';pa.hidden=am.value!=='password'}}if(am){{am.onchange=authUI;authUI()}}
 const st=document.getElementById('schedule-times'),sv=document.getElementById('schedule-times-value'),add=document.getElementById('add-time');
@@ -768,17 +856,18 @@ st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelector
 </script></body></html>"""
 
     @staticmethod
-    def network_bytes():
+    def network_counters():
         try:
-            total = 0
+            received, sent = 0, 0
             for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
                 name, values = line.split(":", 1)
                 fields = values.split()
                 if name.strip() != "lo":
-                    total += int(fields[0]) + int(fields[8])
-            return total
+                    received += int(fields[0])
+                    sent += int(fields[8])
+            return {"rx": received, "tx": sent}
         except (OSError, ValueError, IndexError):
-            return 0
+            return {"rx": 0, "tx": 0}
 
     def home_html(self, token):
         disks = {}
@@ -817,29 +906,34 @@ st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelector
             for stamp, task in queue[:8]
         ) or "<p class='muted'>暂无启用的自动任务</p>"
         body = f"""<div class="grid">{''.join(disk_cards) or '<section class="card"><h2>备份磁盘</h2><p class="muted">创建任务后显示</p></section>'}
-<section class="card"><h2>当前总网速</h2><p id="net-speed" style="font-size:28px">计算中…</p><p class="muted">统计本机除回环接口外的收发总和</p></section>
+<section class="card"><h2>当前网速</h2><div class="row"><div style="flex:1"><span class="muted">↓ 下载</span><p class="metric" id="net-rx">计算中…</p></div><div style="flex:1"><span class="muted">↑ 上传</span><p class="metric" id="net-tx">计算中…</p></div></div><p class="muted">统计本机除回环接口外的实时流量</p></section>
 <section class="card"><h2>后续备份队列</h2>{queue_html}</section></div>
 <section class="card"><h2>正在运行</h2><div id="running">读取中…</div></section>
-<section class="card"><div class="row"><h2 style="margin-right:auto">最近重要日志</h2><a href="/logs">查看完整日志</a></div>
+<section class="card"><div class="row"><h2 style="margin-right:auto">最近日志</h2><a href="/logs">查看全部完整日志</a></div>
 <pre>{self.esc(self.read_log(40_000))}</pre></section>
-<script>let nb=0,nt=0;async function live(){{let r=await fetch('/api/status'),d=await r.json(),now=Date.now();
-if(nb)document.getElementById('net-speed').textContent=(Math.max(0,d.network_bytes-nb)/1024/1024/((now-nt)/1000)).toFixed(2)+' MB/s';
-nb=d.network_bytes;nt=now;let box=document.getElementById('running');box.replaceChildren();
-if(d.running.length)d.running.forEach(x=>{{let p=document.createElement('p'),b=document.createElement('b');b.textContent=x.name;p.append(b,' · '+x.phase+' · '+x.progress+'%');box.append(p)}});
+<script>let nr=0,nw=0,nt=0;async function live(){{let r=await fetch('/api/status'),d=await r.json(),now=Date.now();
+if(nt){{let seconds=(now-nt)/1000;document.getElementById('net-rx').textContent=(Math.max(0,d.network_rx-nr)/1024/1024/seconds).toFixed(2)+' MB/s';document.getElementById('net-tx').textContent=(Math.max(0,d.network_tx-nw)/1024/1024/seconds).toFixed(2)+' MB/s'}}
+nr=d.network_rx;nw=d.network_tx;nt=now;let box=document.getElementById('running');box.replaceChildren();
+if(d.running.length)d.running.forEach(x=>{{let p=document.createElement('p'),b=document.createElement('b');b.textContent=x.name;let detail=x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s';p.append(b,' · '+x.phase+' · '+detail);box.append(p)}});
 else{{let p=document.createElement('p');p.className='muted';p.textContent='当前没有运行中的备份';box.append(p)}}}}
-live();setInterval(live,2000);</script>"""
+function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}live();setInterval(live,2000);</script>"""
         return self.page("首页", body, token)
 
     def logs_html(self, token):
-        return self.page("日志", f"""<section class="card"><div class="row"><h1 style="margin-right:auto">应用日志</h1>
-<a class="btn secondary" href="/logs/raw">下载当前日志</a></div><pre>{self.esc(self.read_log())}</pre></section>""", token)
+        return self.page("日志", f"""<section class="card"><div class="row"><h1 style="margin-right:auto">全部应用日志</h1>
+<a class="btn secondary" href="/logs/raw">下载全部日志</a></div><p class="muted">包含当前日志和轮转日志，不再只显示最后 500 KB。</p><pre>{self.esc(self.read_log(None))}</pre></section>""", token)
 
     def dashboard_html(self, token):
         cards = []
         for task in self.config["tasks"]:
             state = self.task_state(task["id"])
             job = self.jobs.get(task["id"])
-            status = f"{job.get('phase', '运行中')} {job['progress']}%" if job else state.get("last_result", "尚未运行")
+            status = (
+                f"{job.get('phase', '运行中')} {job['progress']}%"
+                if job and job.get("total_bytes") else
+                f"{job.get('phase', '运行中')} · 已传输 {human_size(job.get('transferred_bytes', 0))} · {human_size(job.get('speed_bps', 0))}/s"
+                if job else state.get("last_result", "尚未运行")
+            )
             next_run = datetime.fromtimestamp(state["next_run"]).strftime("%Y-%m-%d %H:%M") if state.get("next_run") else "待安排"
             error = f"<p class='bad'>原因：{self.esc(state.get('last_error'))}</p>" if state.get("last_error") else ""
             action = (
@@ -852,9 +946,31 @@ live();setInterval(live,2000);</script>"""
 <p><b>状态：</b>{self.esc(status)}　<b>下次：</b>{next_run}</p>
 <p><b>远程：</b>{self.esc(task['remote_path'])}<br><b>本地：</b>{self.esc(task['backup_dir'])}</p>
 <p><b>最近备份：</b>{self.esc(state.get('last_backup') or '无')}</p>{error}<div class="row">{action}
-<a class="btn secondary" href="/task?id={task['id']}">编辑</a></div></section>""")
+<a class="btn secondary" href="/task/detail?id={task['id']}">详情</a><a class="btn secondary" href="/task?id={task['id']}">编辑</a></div></section>""")
         empty = "<section class='card'><h2>还没有备份任务</h2><p>点击“新建任务”，只需填写服务器和路径即可开始。</p></section>"
         return self.page("任务", "<div class='grid'>" + ("".join(cards) or empty) + "</div>", token)
+
+    def task_detail_html(self, task, token):
+        if not task:
+            return self.page("任务不存在", "<section class='card'><h1>任务不存在</h1></section>", token)
+        task_id = task["id"]
+        state = self.task_state(task_id)
+        job = self.jobs.get(task_id)
+        phase = job.get("phase", "运行中") if job else state.get("last_result", "尚未运行")
+        progress = job.get("progress", 0) if job else 0
+        transferred = job.get("transferred_bytes", 0) if job else 0
+        total = job.get("total_bytes", 0) if job else 0
+        body = f"""<section class="card"><div class="row"><div style="margin-right:auto"><h1>{self.esc(task['name'])}</h1>
+<p class="muted">任务 ID {task_id} · {self.esc(task['remote_user'])}@{self.esc(task['remote_host'])}</p></div><a class="btn secondary" href="/task?id={task_id}">编辑</a></div>
+<h2 id="detail-phase">{self.esc(phase)}</h2><div class="progress"><span id="detail-bar" style="width:{progress}%"></span></div>
+<p id="detail-summary">{progress}% · {human_size(transferred)} / {human_size(total) if total else '总大小暂未取得'}</p>
+<p class="muted">多线程模式下显示活跃传输槽位。槽位速度和已传输量来自本地断点文件的实际增长；百分比为整个任务的总体进度。</p></section>
+<section class="card"><h2>活跃传输槽位</h2><div style="overflow:auto"><table><thead><tr><th>槽位</th><th>当前文件</th><th>速度</th><th>已传输</th><th>任务进度</th></tr></thead><tbody id="slot-rows"><tr><td colspan="5" class="muted">暂无活跃传输</td></tr></tbody></table></div></section>
+<section class="card"><div class="row"><h2 style="margin-right:auto">该任务的全部日志</h2><a class="btn secondary" href="/logs">全部应用日志</a></div><pre id="task-log">{self.esc(self.read_task_log(task_id))}</pre></section>
+<script>const taskId={json.dumps(task_id)};function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}
+async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow();['#'+s.slot,s.name,fmt(s.speed_bps)+'/s',fmt(s.bytes),s.progress+'%'].forEach(v=>{{let td=tr.insertCell();td.textContent=v}})}})}}
+async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURIComponent(taskId));document.getElementById('task-log').textContent=await r.text()}}detail();setInterval(detail,2000);setInterval(taskLog,5000);</script>"""
+        return self.page("任务详情", body, token)
 
     def task_form_html(self, task, token):
         task = dict(TASK_DEFAULTS if task is None else task)
@@ -928,14 +1044,14 @@ html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#43536a
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);font:15px system-ui;color:var(--fg);display:grid;place-items:center;min-height:100vh}}
 .login{{width:min(390px,calc(100% - 28px));background:var(--card);padding:30px;border-radius:14px;box-shadow:0 12px 36px #17243b24}}
 input{{width:100%;padding:12px;margin:6px 0 16px;border:1px solid var(--border);border-radius:8px;background:var(--input);color:var(--fg)}}button{{width:100%;padding:12px;border:0;border-radius:8px;background:#1769aa;color:white}}
-.theme{{position:fixed;right:16px;top:16px;width:auto;padding:7px;background:transparent;color:var(--fg)}}.theme svg{{width:20px;height:20px;display:block}}.bad{{color:#e04444}}</style></head><body>
-<button type="button" class="theme" id="theme" aria-label="切换主题" title="切换主题"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20V2Zm0 18a8 8 0 0 1 0-16v16Z"/></svg></button><form class="login" method="post" action="/login">
+.theme{{position:fixed;right:16px;top:16px;width:auto;padding:7px;background:transparent;color:var(--fg);font-size:22px;transition:transform .18s}}.theme.changed{{transform:rotate(25deg) scale(1.15)}}.bad{{color:#e04444}}</style></head><body>
+<button type="button" class="theme" id="theme" aria-label="切换主题" title="切换主题">◐</button><form class="login" method="post" action="/login">
 <h1>Simple Backup</h1><p>登录备份管理面板</p>{alert}<label>用户名</label>
 <input name="username" required autofocus autocomplete="username"><label>密码</label>
 <input name="password" type="password" required maxlength="256" autocomplete="current-password"><button>登录</button>
-</form><script>const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}};
-function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title)}}
-tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto')}};ts(document.documentElement.dataset.theme);</script></body></html>"""
+</form><script>const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}},ti={{auto:'◐',light:'☀',dark:'☾'}};
+function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent=ti[t];tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title);if(feedback){{tb.classList.remove('changed');void tb.offsetWidth;tb.classList.add('changed');setTimeout(()=>tb.classList.remove('changed'),220)}}}}
+tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);</script></body></html>"""
 
     def save_task_form(self, form):
         task_id = form.get("id", "")
@@ -1076,22 +1192,36 @@ class Handler(BaseHTTPRequestHandler):
         elif path.path == "/task":
             task = self.app.task(query.get("id", [""])[0])
             self.send_html(self.app.task_form_html(task, token))
+        elif path.path == "/task/detail":
+            task = self.app.task(query.get("id", [""])[0])
+            self.send_html(self.app.task_detail_html(task, token))
         elif path.path == "/settings":
             self.send_html(self.app.settings_html(token))
         elif path.path == "/logs":
             self.send_html(self.app.logs_html(token))
         elif path.path == "/logs/raw":
             self.send_data(self.app.read_log(None), "text/plain; charset=utf-8")
+        elif path.path == "/api/task-log":
+            task_id = query.get("id", [""])[0]
+            if self.app.task(task_id):
+                self.send_data(self.app.read_task_log(task_id), "text/plain; charset=utf-8")
+            else:
+                self.send_data("任务不存在", "text/plain; charset=utf-8")
         elif path.path == "/api/status":
             running = [
                 {
                     "id": task_id, "name": self.app.task(task_id)["name"],
                     "phase": job.get("phase", "运行中"), "progress": job.get("progress", 0),
+                    "speed_bps": job.get("speed_bps", 0),
+                    "transferred_bytes": job.get("transferred_bytes", 0),
+                    "total_bytes": job.get("total_bytes", 0),
+                    "slots": job.get("slots", []),
                 }
                 for task_id, job in list(self.app.jobs.items()) if self.app.task(task_id)
             ]
+            network = self.app.network_counters()
             self.send_data(
-                json.dumps({"network_bytes": self.app.network_bytes(), "running": running}),
+                json.dumps({"network_rx": network["rx"], "network_tx": network["tx"], "running": running}),
                 "application/json; charset=utf-8",
             )
         else:
@@ -1181,7 +1311,7 @@ class Handler(BaseHTTPRequestHandler):
             if not target:
                 raise ValueError("备份不存在")
             self.app.delete_backup(target)
-            self.app.notify(f"已删除备份：{task['name']} / {target.name}")
+            self.app.notify(f"已删除备份：{task['name']} / {target.name}", task["id"])
             self.redirect(f"/task?id={task['id']}")
         elif path == "/settings":
             username = form.get("admin_username", "").strip()

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -130,7 +131,31 @@ class BackupManagerTest(unittest.TestCase):
             self.assertEqual(datetime.fromtimestamp(first).strftime("%Y-%m-%d %H:%M"), "2026-07-18 14:00")
             self.assertEqual(datetime.fromtimestamp(second).strftime("%Y-%m-%d %H:%M"), "2026-07-19 02:00")
             self.assertIn("donut", app.home_html(app.sign_session("panel-user")))
+            self.assertIn("net-rx", app.home_html(app.sign_session("panel-user")))
             self.assertIn('/telegram/test', app.settings_html(app.sign_session("panel-user")))
+
+            progress_task = sample_task(root / "progress", transfer_threads=4)
+            staging = root / "staging"
+            staging.mkdir()
+            growing = staging / "large.bin"
+            growing.write_bytes(b"x" * 512)
+            job = {
+                "total_bytes": 1024, "progress": 0, "next_progress_notice": 75,
+                "_sample_time": time.time() - 1, "_sample_total": 0,
+                "_file_samples": {"large.bin": (0, time.time() - 1)},
+            }
+            app.sample_transfer(staging, progress_task, job)
+            self.assertEqual(job["progress"], 50)
+            self.assertGreater(job["speed_bps"], 0)
+            self.assertEqual(job["slots"][0]["name"], "large.bin")
+
+            app.config["tasks"].append(progress_task)
+            app.log("只属于这个任务", task_id=progress_task["id"])
+            self.assertIn("只属于这个任务", app.read_task_log(progress_task["id"]))
+            detail = app.task_detail_html(progress_task, app.sign_session("panel-user"))
+            self.assertIn("活跃传输槽位", detail)
+            self.assertIn("该任务的全部日志", detail)
+            self.assertIn("☀", detail)
 
     def test_installer_does_not_overwrite_panel_port(self):
         script = Path("install.sh").read_text(encoding="utf-8")
