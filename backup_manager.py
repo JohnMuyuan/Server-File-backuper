@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple Backup: a small Linux rsync backup daemon with a Chinese web UI."""
+"""Simple Backup: a small Linux backup daemon with a Chinese web UI."""
 
 import argparse
 import base64
@@ -13,6 +13,7 @@ import secrets
 import selectors
 import shutil
 import signal
+import ssl
 import subprocess
 import threading
 import time
@@ -34,11 +35,15 @@ DEFAULTS = {
     "backup_dir": "/var/backups/simple-backup",
     "interval_days": 3,
     "retention_limit": 0,
+    "transfer_threads": 4,
     "enabled": False,
     "telegram_bot_token": "",
     "telegram_chat_id": "",
-    "listen_host": "127.0.0.1",
+    "admin_username": "admin",
+    "listen_host": "0.0.0.0",
     "listen_port": 8088,
+    "tls_cert": "/var/lib/simple-backup/server.crt",
+    "tls_key": "/var/lib/simple-backup/server.key",
 }
 
 
@@ -52,6 +57,8 @@ def atomic_json(path, value):
 
 
 def password_fields(password):
+    if len(password) < 10 or any(ord(char) < 32 for char in password):
+        raise ValueError("管理密码至少需要 10 位且不能包含控制字符")
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
     return {"password_salt": salt.hex(), "password_hash": digest.hex()}
@@ -81,12 +88,15 @@ def validate_config(data):
     remote_path = str(data.get("remote_path", "")).strip()
     backup_dir = str(data.get("backup_dir", "")).strip()
     ssh_key = str(data.get("ssh_key", "")).strip()
+    admin_username = str(data.get("admin_username", "admin")).strip()
     if host and not re.fullmatch(r"[A-Za-z0-9._:-]+", host):
         raise ValueError("服务器地址只能包含字母、数字、点、横线和冒号")
     if user and not re.fullmatch(r"[A-Za-z0-9._-]+", user):
         raise ValueError("SSH 用户名格式不正确")
     if not remote_path.startswith("/") or any(c in remote_path for c in "\r\n\0"):
         raise ValueError("远程目录必须是绝对路径")
+    if any(c in backup_dir or c in ssh_key for c in "\r\n\0"):
+        raise ValueError("本机路径不能包含换行符")
     if not Path(backup_dir).is_absolute():
         raise ValueError("本机备份目录必须是绝对路径")
     if backup_dir.rstrip("/") == "":
@@ -96,6 +106,7 @@ def validate_config(data):
     port = int(data.get("remote_port", 22))
     days = float(data.get("interval_days", 3))
     keep = int(data.get("retention_limit", 0))
+    threads = int(data.get("transfer_threads", 4))
     listen_port = int(data.get("listen_port", 8088))
     if not 1 <= port <= 65535 or not 1 <= listen_port <= 65535:
         raise ValueError("端口必须在 1 到 65535 之间")
@@ -103,9 +114,14 @@ def validate_config(data):
         raise ValueError("备份周期必须在 0.01 到 3650 天之间")
     if not 0 <= keep <= 100000:
         raise ValueError("保留份数不能小于 0")
+    if not 1 <= threads <= 16:
+        raise ValueError("下载线程数必须在 1 到 16 之间")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", admin_username):
+        raise ValueError("管理用户名需要 3-32 位，只能使用字母、数字、点、横线和下划线")
     data.update(remote_host=host, remote_user=user, remote_path=remote_path,
                 backup_dir=backup_dir, ssh_key=ssh_key, remote_port=port,
-                interval_days=days, retention_limit=keep, listen_port=listen_port)
+                interval_days=days, retention_limit=keep, transfer_threads=threads,
+                admin_username=admin_username, listen_port=listen_port)
     return data
 
 
@@ -208,7 +224,8 @@ class BackupApp:
 
     def backup_job(self, source):
         started = time.time()
-        self.notify(f"▶️ 备份任务开始（{source}）")
+        threads = int(self.config.get("transfer_threads", 4))
+        self.notify(f"▶️ 备份任务开始（{source}，{threads} 线程）")
         try:
             error = ""
             retention_done = False
@@ -220,7 +237,7 @@ class BackupApp:
                     if not retention_done:
                         self.apply_retention()
                         retention_done = True
-                    ok, result = self.run_rsync()
+                    ok, result = self.run_transfer()
                 except Exception as exc:
                     ok, result = False, str(exc)
                 if ok:
@@ -272,7 +289,11 @@ class BackupApp:
             shutil.rmtree(oldest)
             self.notify(f"🗑 已删除最旧备份：{oldest.name}")
 
-    def run_rsync(self):
+    @staticmethod
+    def lftp_quote(value):
+        return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+
+    def run_transfer(self):
         cfg = self.config.copy()
         root = Path(cfg["backup_dir"])
         partial = root / ".partial"
@@ -285,11 +306,34 @@ class BackupApp:
         if cfg.get("ssh_key"):
             ssh += ["-i", cfg["ssh_key"]]
         import shlex
-        cmd = ["rsync", "-a", "--delete", "--partial", "-s",
-               "--info=progress2", "--human-readable",
-               "-e", " ".join(shlex.quote(x) for x in ssh)]
-        source = f"{cfg['remote_user']}@{host}:{cfg['remote_path'].rstrip('/')}/"
-        cmd += [source, str(partial) + "/"]
+        threads = int(cfg.get("transfer_threads", 4))
+        if threads > 1:
+            parallel = max(1, int(threads ** 0.5))
+            segments = max(2, threads // parallel)
+            ssh_program = ["ssh", "-a", "-x", "-o", "BatchMode=yes",
+                           "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
+            if cfg.get("ssh_key"):
+                ssh_program += ["-i", cfg["ssh_key"]]
+            script = "; ".join((
+                "set cmd:fail-exit yes",
+                "set net:max-retries 2",
+                "set net:timeout 30",
+                "set mirror:parallel-directories true",
+                f"set sftp:connect-program {self.lftp_quote(' '.join(shlex.quote(x) for x in ssh_program))}",
+                f"open -p {cfg['remote_port']} -u {self.lftp_quote(cfg['remote_user'])} {self.lftp_quote('sftp://' + host)}",
+                f"mirror -a --continue --delete --parallel={parallel} --use-pget-n={segments} --verbose=1 {self.lftp_quote(cfg['remote_path'])} {self.lftp_quote(str(partial))}",
+                "bye",
+            ))
+            cmd = ["lftp", "--norc", "-c", script]
+            self.state["progress"] = f"{threads} 线程传输中"
+            tool_name = "lftp"
+        else:
+            cmd = ["rsync", "-a", "--delete", "--partial", "-s",
+                   "--info=progress2", "--human-readable",
+                   "-e", " ".join(shlex.quote(x) for x in ssh)]
+            source = f"{cfg['remote_user']}@{host}:{cfg['remote_path'].rstrip('/')}/"
+            cmd += [source, str(partial) + "/"]
+            tool_name = "rsync"
         try:
             self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                             start_new_session=True)
@@ -328,7 +372,7 @@ class BackupApp:
         if code != 0:
             message = output.decode(errors="replace").strip().replace("\r", "\n")
             lines = [line.strip() for line in message.splitlines() if line.strip()]
-            return False, (lines[-1] if lines else f"rsync 退出码 {code}")[:1000]
+            return False, (lines[-1] if lines else f"{tool_name} 退出码 {code}")[:1000]
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         safe_host = re.sub(r"[^A-Za-z0-9._-]", "_", cfg["remote_host"])
         final = root / f"{stamp}_{safe_host}"
@@ -444,6 +488,10 @@ class BackupApp:
 
 class Handler(BaseHTTPRequestHandler):
     app = None
+    server_version = "SimpleBackup"
+    sys_version = ""
+    failures = {}
+    failure_lock = threading.Lock()
 
     def log_message(self, fmt, *args):
         print("Web:", fmt % args, flush=True)
@@ -452,28 +500,51 @@ class Handler(BaseHTTPRequestHandler):
         expected = self.app.config.get("password_hash")
         if not expected:
             return False
+        ip = self.client_address[0]
+        now = time.time()
+        with self.failure_lock:
+            count, started, blocked = self.failures.get(ip, (0, now, 0))
+            if blocked > now:
+                return False
         try:
             header = self.headers.get("Authorization", "")
             raw = base64.b64decode(header[6:] if header.startswith("Basic ") else "").decode()
             user, password = raw.split(":", 1)
             salt = bytes.fromhex(self.app.config["password_salt"])
             actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000).hex()
-            return user == "admin" and hmac.compare_digest(actual, expected)
+            valid = user == self.app.config.get("admin_username", "admin") and hmac.compare_digest(actual, expected)
         except Exception:
-            return False
+            valid = False
+        with self.failure_lock:
+            if valid:
+                self.failures.pop(ip, None)
+            else:
+                if now - started > 300:
+                    count, started = 0, now
+                count += 1
+                self.failures[ip] = (count, started, now + 900 if count >= 5 else 0)
+        return valid
 
     def authenticate(self):
         if self.auth_ok():
             return True
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="Simple Backup"')
+        self.security_headers()
         self.end_headers()
         return False
+
+    def security_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
 
     def send_json(self, value, code=200):
         body = json.dumps(value, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -490,6 +561,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self.page().encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -527,8 +599,8 @@ class Handler(BaseHTTPRequestHandler):
         old_token = self.app.config.get("telegram_bot_token", "")
         updated = self.app.config.copy()
         for key in ("remote_host", "remote_user", "remote_path", "ssh_key", "backup_dir",
-                    "remote_port", "interval_days", "retention_limit", "telegram_bot_token",
-                    "telegram_chat_id"):
+                    "remote_port", "interval_days", "retention_limit", "transfer_threads",
+                    "admin_username", "telegram_bot_token", "telegram_chat_id"):
             updated[key] = form.get(key, "")
         updated["enabled"] = form.get("enabled") == "on"
         validate_config(updated)
@@ -566,33 +638,78 @@ class Handler(BaseHTTPRequestHandler):
 <label>本机备份目录<input name="backup_dir" required value="{esc('backup_dir')}"></label>
 <label>每几天备份一次<input name="interval_days" type="number" min="0.01" max="3650" step="0.01" required value="{esc('interval_days')}" placeholder="3"><small>例如填 3，就是每 3 天一次</small></label>
 <label>最多保留几份<input name="retention_limit" type="number" min="0" value="{esc('retention_limit')}"><small>填 0 表示全部保留</small></label>
+<label>下载线程数<input name="transfer_threads" type="number" min="1" max="16" required value="{esc('transfer_threads')}"><small>推荐 4；填 1 使用兼容模式</small></label>
 </div><p><label class="toggle"><input name="enabled" type="checkbox" {checked}>开启定时自动备份</label></p>
-<h3>Telegram 通知与控制（可选）</h3><div class="grid"><label>机器人 Token<input name="telegram_bot_token" type="password" value="{esc('telegram_bot_token')}"></label><label>允许控制的 Chat ID<input name="telegram_chat_id" value="{esc('telegram_chat_id')}"></label><label>修改管理密码<input name="new_password" type="password" minlength="10" placeholder="留空表示不修改"></label></div>
+<h3>面板安全</h3><div class="grid"><label>管理用户名<input name="admin_username" required minlength="3" maxlength="32" value="{esc('admin_username')}"></label><label>修改管理密码<input name="new_password" type="password" minlength="10" placeholder="留空表示不修改"></label></div>
+<h3>Telegram 通知与控制（可选）</h3><div class="grid"><label>机器人 Token<input name="telegram_bot_token" type="password" value="{esc('telegram_bot_token')}"></label><label>允许控制的 Chat ID<input name="telegram_chat_id" value="{esc('telegram_chat_id')}"></label></div>
 <p><button type="submit">保存全部设置</button></p></form>
 <section class="card"><h2>已有备份</h2><ul>{rows or '<li>暂无备份</li>'}</ul></section></main><div id="msg"></div>
 <script>const csrf={json.dumps(self.app.csrf)};function toast(s){{let m=document.querySelector('#msg');m.textContent=s;m.style.display='block';setTimeout(()=>m.style.display='none',4000)}}async function post(url,data={{}}){{let b=new URLSearchParams({{csrf,...data}}),r=await fetch(url,{{method:'POST',body:b}}),j=await r.json();toast(j.message);if(j.ok&&url.includes('delete'))setTimeout(()=>location.reload(),700);return j}}function act(url,name){{if(url.includes('delete')&&!confirm('确定删除 '+name+'？此操作不可恢复。'))return;post(url,name?{{name}}:{{}})}}async function save(e){{e.preventDefault();let r=await fetch('/save',{{method:'POST',body:new URLSearchParams(new FormData(e.target))}}),j=await r.json();toast(j.message)}}async function status(){{let s=await(await fetch('/api/status')).json();run.textContent=s.running?'备份运行中':(s.enabled?'自动备份已开启':'自动备份已关闭');progress.textContent=s.progress;free.textContent=s.free;next.textContent=s.next_run;error.textContent=s.last_error||s.last_result}}status();setInterval(status,3000)</script></body></html>'''
 
 
-def initialize(data_dir):
+def initialize(data_dir, username="admin", password="", listen_host="0.0.0.0", listen_port=8088,
+               tls_cert="/var/lib/simple-backup/server.crt", tls_key="/var/lib/simple-backup/server.key"):
     path = Path(data_dir) / "config.json"
     if path.exists():
         print("配置已存在，未覆盖。")
         return
-    password = secrets.token_urlsafe(12)
+    password = password or secrets.token_urlsafe(12)
+    if len(password) < 10:
+        raise ValueError("管理密码至少需要 10 位")
     config = DEFAULTS.copy()
+    config.update(admin_username=username, listen_host=listen_host, listen_port=int(listen_port),
+                  tls_cert=tls_cert, tls_key=tls_key)
     config.update(password_fields(password))
+    validate_config(config)
     atomic_json(path, config)
     atomic_json(Path(data_dir) / "state.json", {"next_run": 0, "last_result": "尚未备份", "last_backup": "", "last_error": "", "low_disk": False, "telegram_offset": 0})
-    print(f"管理用户名：admin\n管理密码：{password}")
+    print(f"管理用户名：{username}\n管理密码：{password}")
+
+
+def configure_panel(data_dir, username="", password="", listen_host="", listen_port="",
+                    tls_cert="", tls_key=""):
+    app = BackupApp(data_dir)
+    updated = app.config.copy()
+    if username:
+        updated["admin_username"] = username
+    if listen_host:
+        updated["listen_host"] = listen_host
+    if listen_port:
+        updated["listen_port"] = int(listen_port)
+    if tls_cert:
+        updated["tls_cert"] = tls_cert
+    if tls_key:
+        updated["tls_key"] = tls_key
+    if password:
+        if len(password) < 10:
+            raise ValueError("管理密码至少需要 10 位")
+        updated.update(password_fields(password))
+    validate_config(updated)
+    app.config = updated
+    app.save_config()
+    print(f"面板设置已更新：{updated['admin_username']}@{updated['listen_host']}:{updated['listen_port']}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Simple Backup")
     parser.add_argument("--data-dir", default=os.environ.get("SIMPLE_BACKUP_HOME", "/var/lib/simple-backup"))
     parser.add_argument("--init", action="store_true")
+    parser.add_argument("--configure-panel", action="store_true")
+    parser.add_argument("--panel-user", default=os.environ.get("SIMPLE_BACKUP_PANEL_USER", ""))
+    parser.add_argument("--panel-password", default=os.environ.get("SIMPLE_BACKUP_PANEL_PASSWORD", ""))
+    parser.add_argument("--panel-host", default=os.environ.get("SIMPLE_BACKUP_PANEL_HOST", ""))
+    parser.add_argument("--panel-port", default=os.environ.get("SIMPLE_BACKUP_PANEL_PORT", ""))
+    parser.add_argument("--tls-cert", default=os.environ.get("SIMPLE_BACKUP_TLS_CERT", ""))
+    parser.add_argument("--tls-key", default=os.environ.get("SIMPLE_BACKUP_TLS_KEY", ""))
     args = parser.parse_args()
     if args.init:
-        initialize(args.data_dir)
+        initialize(args.data_dir, args.panel_user or "admin", args.panel_password,
+                   args.panel_host or "0.0.0.0", args.panel_port or 8088,
+                   args.tls_cert or DEFAULTS["tls_cert"], args.tls_key or DEFAULTS["tls_key"])
+        return
+    if args.configure_panel:
+        configure_panel(args.data_dir, args.panel_user, args.panel_password, args.panel_host,
+                        args.panel_port, args.tls_cert, args.tls_key)
         return
     app = BackupApp(args.data_dir)
     validate_config(app.config)
@@ -600,7 +717,14 @@ def main():
     threading.Thread(target=app.scheduler, daemon=True).start()
     threading.Thread(target=app.telegram, daemon=True).start()
     server = ThreadingHTTPServer((app.config["listen_host"], int(app.config["listen_port"])), Handler)
-    print(f"Simple Backup 已启动：http://{app.config['listen_host']}:{app.config['listen_port']}", flush=True)
+    cert, key = Path(app.config["tls_cert"]), Path(app.config["tls_key"])
+    if not cert.is_file() or not key.is_file():
+        raise SystemExit("HTTPS 证书不存在，请运行 simple-backup 管理菜单重新生成")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    print(f"Simple Backup 已启动：https://{app.config['listen_host']}:{app.config['listen_port']}", flush=True)
     try:
         server.serve_forever()
     finally:
