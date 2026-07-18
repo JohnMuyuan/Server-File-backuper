@@ -55,6 +55,16 @@ class BackupManagerTest(unittest.TestCase):
             password_task = {**task, "auth_method": "password"}
             app.set_task_password(task["id"], "remote secret")
             self.assertIn("sshpass -e ssh", app.transfer_command(password_task, root / "partial")[2])
+            mysql_task = sample_task(
+                root / "mysql", source_type="mysql", database_user="backup",
+                database_name="app", database_port=0,
+            )
+            mysql_command = " ".join(app.database_command(mysql_task))
+            self.assertIn("mysqldump", mysql_command)
+            self.assertNotIn("database-secret", mysql_command)
+            self.assertIn("redis-cli", " ".join(app.database_command({
+                **mysql_task, "source_type": "redis", "database_user": "", "database_name": "",
+            })))
             self.assertEqual(human_size(3 * 1024 ** 3), "3.0 GB")
 
             compressed_task = sample_task(root / "compressed", id="b1b2c3d4", retention_limit=0)
@@ -76,6 +86,19 @@ class BackupManagerTest(unittest.TestCase):
             self.assertTrue(final.name.endswith(".tar.zst"))
             self.assertEqual(size, 4)
             self.assertFalse((Path(compressed_task["backup_dir"]) / f".partial-{compressed_task['id']}").exists())
+
+            database_backup = sample_task(
+                root / "database-compressed", id="c1b2c3d4", source_type="postgresql",
+                database_user="backup", database_name="app",
+            )
+            app.dump_database = lambda _task, staging, _job: (
+                (staging / "postgresql-app.sql").write_bytes(b"sql") and 0, ""
+            )
+            final, _, _ = app.backup_once(
+                database_backup,
+                {"stop": threading.Event(), "phase": "", "progress": 0},
+            )
+            self.assertTrue(final.name.endswith(".tar.zst"))
 
     def test_validation_migration_credentials_and_sessions(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -118,6 +141,20 @@ class BackupManagerTest(unittest.TestCase):
             config_text = (root / "data" / "config.json").read_text(encoding="utf-8")
             self.assertNotIn("only-in-secret-file", config_text)
 
+            database_form = {
+                **form, "name": "MySQL", "remote_host": "mysql.example.com",
+                "backup_dir": str(root / "mysql-backups"), "source_type": "mysql",
+                "database_host": "127.0.0.1", "database_port": "0",
+                "database_user": "backup", "database_name": "app",
+                "database_password": "database-secret", "ssh_password": "ssh-secret",
+            }
+            database_task = app.save_task_form(database_form)
+            self.assertEqual(app.task_database_password(database_task["id"]), "database-secret")
+            secret_text = app.secret_path(database_task["id"]).read_text(encoding="utf-8")
+            self.assertIn("ssh-secret", secret_text)
+            self.assertIn("database-secret", secret_text)
+            self.assertNotIn("database-secret", app.config_path.read_text(encoding="utf-8"))
+
             for _ in range(5):
                 app.login_failed("192.0.2.1")
             self.assertFalse(app.login_allowed("192.0.2.1"))
@@ -132,7 +169,10 @@ class BackupManagerTest(unittest.TestCase):
             self.assertEqual(datetime.fromtimestamp(second).strftime("%Y-%m-%d %H:%M"), "2026-07-19 02:00")
             self.assertIn("donut", app.home_html(app.sign_session("panel-user")))
             self.assertIn("net-rx", app.home_html(app.sign_session("panel-user")))
+            self.assertIn("queue-item", app.home_html(app.sign_session("panel-user")))
+            self.assertIn("@media(max-width:640px)", app.home_html(app.sign_session("panel-user")))
             self.assertIn('/telegram/test', app.settings_html(app.sign_session("panel-user")))
+            self.assertIn('source-type', app.task_form_html(database_task, app.sign_session("panel-user")))
 
             progress_task = sample_task(root / "progress", transfer_threads=4)
             staging = root / "staging"

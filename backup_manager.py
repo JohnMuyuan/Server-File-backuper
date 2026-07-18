@@ -40,6 +40,8 @@ DEFAULTS = {
 TASK_DEFAULTS = {
     "id": "", "name": "新备份任务", "remote_host": "", "remote_port": 22,
     "remote_user": "root", "remote_path": "/", "ssh_key": "/root/.ssh/id_ed25519",
+    "source_type": "files", "database_host": "127.0.0.1", "database_port": 0,
+    "database_user": "", "database_name": "",
     "backup_dir": "/var/backups/simple-backup", "interval_days": 3,
     "schedule_times": ["02:00"],
     "retention_limit": 0, "transfer_threads": 4, "enabled": True,
@@ -115,7 +117,10 @@ def validate_task(raw, existing_id=""):
     task = dict(TASK_DEFAULTS)
     task.update(raw)
     task["id"] = str(existing_id or task.get("id") or secrets.token_hex(4)).lower()
-    for key in ("name", "remote_host", "remote_user", "remote_path", "ssh_key", "backup_dir"):
+    for key in (
+        "name", "remote_host", "remote_user", "remote_path", "ssh_key", "backup_dir",
+        "source_type", "database_host", "database_user", "database_name",
+    ):
         task[key] = str(task.get(key, "")).strip()
     try:
         task["remote_port"] = int(task["remote_port"])
@@ -123,6 +128,7 @@ def validate_task(raw, existing_id=""):
         task["interval_days"] = max(1, round(old_days))
         task["retention_limit"] = int(task["retention_limit"])
         task["transfer_threads"] = int(task["transfer_threads"])
+        task["database_port"] = int(task["database_port"] or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError("端口、周期、保留份数和线程数必须是数字") from exc
     task["enabled"] = bool(task.get("enabled"))
@@ -146,8 +152,18 @@ def validate_task(raw, existing_id=""):
         raise ValueError("服务器地址只能使用域名、IP 或 IPv6 地址字符")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", task["remote_user"]):
         raise ValueError("SSH 用户名格式无效")
-    if not task["remote_path"].startswith("/") or any(ord(c) < 32 for c in task["remote_path"]):
+    if task["source_type"] not in ("files", "mysql", "postgresql", "redis"):
+        raise ValueError("备份类型无效")
+    if task["source_type"] == "files" and (not task["remote_path"].startswith("/") or any(ord(c) < 32 for c in task["remote_path"])):
         raise ValueError("远程路径必须是绝对路径")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", task["database_host"]):
+        raise ValueError("数据库地址格式无效")
+    if task["database_user"] and not re.fullmatch(r"[^\x00-\x1f]{1,128}", task["database_user"]):
+        raise ValueError("数据库用户名格式无效")
+    if task["database_name"] and not re.fullmatch(r"[^\x00-\x1f]{1,128}", task["database_name"]):
+        raise ValueError("数据库名称格式无效")
+    if task["source_type"] in ("mysql", "postgresql") and (not task["database_user"] or not task["database_name"]):
+        raise ValueError("MySQL / PostgreSQL 必须填写数据库用户名和数据库名称")
     if not Path(task["backup_dir"]).is_absolute() or Path(task["backup_dir"]) == Path("/"):
         raise ValueError("本地备份目录必须是绝对路径，且不能是根目录")
     if task["ssh_key"] and not Path(task["ssh_key"]).is_absolute():
@@ -156,6 +172,8 @@ def validate_task(raw, existing_id=""):
         raise ValueError("SSH 认证方式无效")
     if not 1 <= task["remote_port"] <= 65535:
         raise ValueError("SSH 端口必须在 1-65535 之间")
+    if not 0 <= task["database_port"] <= 65535:
+        raise ValueError("数据库端口必须在 0-65535 之间；0 表示使用默认端口")
     if not 1 <= task["interval_days"] <= 3650:
         raise ValueError("间隔天数必须在 1-3650 天之间")
     if not task["schedule_times"] or len(task["schedule_times"]) > 24:
@@ -185,24 +203,58 @@ def migrate_config(config):
 
 
 REMOTE_SETUP = r'''set -eu
-has_sftp=0
-for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/openssh/sftp-server; do
-  [ -x "$p" ] && has_sftp=1
-done
-if command -v sshd >/dev/null 2>&1; then
-  sshd -T 2>/dev/null | grep -Eq '^subsystem sftp (internal-sftp|/)' && has_sftp=1 || true
+kind=${1:-files}
+if [ "$kind" = files ]; then
+  has_sftp=0
+  for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/openssh/sftp-server; do [ -x "$p" ] && has_sftp=1; done
+  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null | grep -Eq '^subsystem sftp (internal-sftp|/)' && has_sftp=1 || true
+  command -v rsync >/dev/null 2>&1 && [ "$has_sftp" -eq 1 ] && exit 0
+elif [ "$kind" = mysql ]; then
+  if command -v mysqldump >/dev/null 2>&1 || command -v mariadb-dump >/dev/null 2>&1; then exit 0; fi
+elif [ "$kind" = postgresql ]; then
+  if command -v pg_dump >/dev/null 2>&1; then exit 0; fi
+elif [ "$kind" = redis ]; then
+  if command -v redis-cli >/dev/null 2>&1; then exit 0; fi
 fi
-command -v rsync >/dev/null 2>&1 && [ "$has_sftp" -eq 1 ] && exit 0
 if [ "$(id -u)" -eq 0 ]; then run() { "$@"; }
 elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then run() { sudo -n "$@"; }
-else echo "缺少 rsync/SFTP，且当前 SSH 用户没有 root 或免密 sudo 权限" >&2; exit 42; fi
-if command -v apt-get >/dev/null 2>&1; then run apt-get update; run apt-get install -y rsync openssh-sftp-server
-elif command -v dnf >/dev/null 2>&1; then run dnf install -y rsync openssh-server
-elif command -v yum >/dev/null 2>&1; then run yum install -y rsync openssh-server
-elif command -v zypper >/dev/null 2>&1; then run zypper --non-interactive install rsync openssh
-elif command -v pacman >/dev/null 2>&1; then run pacman -Sy --noconfirm rsync openssh
-elif command -v apk >/dev/null 2>&1; then run apk add rsync openssh-server
-else echo "不支持的远程包管理器，请手动安装 rsync 和 OpenSSH SFTP 服务" >&2; exit 43; fi
+else echo "缺少备份客户端，且当前 SSH 用户没有 root 或免密 sudo 权限" >&2; exit 42; fi
+case "$kind" in
+  files) apt_pkg='rsync openssh-sftp-server'; rpm_pkg='rsync openssh-server'; zypp_pkg='rsync openssh'; arch_pkg='rsync openssh'; apk_pkg='rsync openssh-server' ;;
+  mysql) apt_pkg='default-mysql-client'; rpm_pkg='mariadb'; zypp_pkg='mariadb-client'; arch_pkg='mariadb-clients'; apk_pkg='mysql-client' ;;
+  postgresql) apt_pkg='postgresql-client'; rpm_pkg='postgresql'; zypp_pkg='postgresql'; arch_pkg='postgresql'; apk_pkg='postgresql-client' ;;
+  redis) apt_pkg='redis-tools'; rpm_pkg='redis'; zypp_pkg='redis'; arch_pkg='redis'; apk_pkg='redis' ;;
+esac
+if command -v apt-get >/dev/null 2>&1; then run apt-get update; run apt-get install -y $apt_pkg
+elif command -v dnf >/dev/null 2>&1; then run dnf install -y $rpm_pkg
+elif command -v yum >/dev/null 2>&1; then run yum install -y $rpm_pkg
+elif command -v zypper >/dev/null 2>&1; then run zypper --non-interactive install $zypp_pkg
+elif command -v pacman >/dev/null 2>&1; then run pacman -Sy --noconfirm $arch_pkg
+elif command -v apk >/dev/null 2>&1; then run apk add $apk_pkg
+else echo "不支持的远程包管理器，请手动安装对应数据库客户端" >&2; exit 43; fi
+'''
+
+DATABASE_DUMP = r'''set -eu
+kind=$1 host=$2 port=$3 user=$4 name=$5
+IFS= read -r password || password=''
+case "$kind" in
+  mysql)
+    export MYSQL_PWD=$password
+    dump=$(command -v mysqldump || command -v mariadb-dump || true)
+    [ -n "$dump" ] || { echo '缺少 mysqldump / mariadb-dump' >&2; exit 127; }
+    exec "$dump" --host="$host" --port="$port" --user="$user" --single-transaction --quick --routines --events --triggers --hex-blob --databases "$name"
+    ;;
+  postgresql)
+    export PGPASSWORD=$password
+    exec pg_dump --host="$host" --port="$port" --username="$user" --no-password --format=plain "$name"
+    ;;
+  redis)
+    export REDISCLI_AUTH=$password
+    set -- redis-cli -h "$host" -p "$port"
+    [ -n "$user" ] && set -- "$@" --user "$user"
+    exec "$@" --rdb -
+    ;;
+esac
 '''
 
 
@@ -276,11 +328,22 @@ class BackupApp:
         return self._read_json(self.secret_path(task_id), {}).get("ssh_password", "")
 
     def set_task_password(self, task_id, password):
+        self.set_task_secret(task_id, "ssh_password", password)
+
+    def task_database_password(self, task_id):
+        return self._read_json(self.secret_path(task_id), {}).get("database_password", "")
+
+    def set_task_secret(self, task_id, key, value):
         path = self.secret_path(task_id)
-        if password:
+        values = self._read_json(path, {})
+        if value:
+            values[key] = value
+        else:
+            values.pop(key, None)
+        if values:
             self.secrets_dir.mkdir(parents=True, exist_ok=True)
             os.chmod(self.secrets_dir, 0o700)
-            atomic_json(path, {"ssh_password": password})
+            atomic_json(path, values)
         elif path.exists():
             path.unlink()
 
@@ -396,7 +459,7 @@ class BackupApp:
         if state.get("dependencies_ready") or not task["auto_install_dependencies"]:
             return
         prefix, _ = self.ssh_program(task)
-        command = [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", "sh", "-s"]
+        command = [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", "sh", "-s", "--", task["source_type"]]
         code, output = self.execute(command, task, job, stdin=REMOTE_SETUP)
         if code:
             raise RuntimeError("远程依赖自动安装失败：" + (output[-500:] or f"退出码 {code}"))
@@ -429,6 +492,63 @@ class BackupApp:
             f"{self.lftp_quote(task['remote_path'])} {self.lftp_quote(destination)}"
         )
         return ["lftp", "-e", script + "; bye"]
+
+    def database_command(self, task):
+        ports = {"mysql": 3306, "postgresql": 5432, "redis": 6379}
+        arguments = (
+            task["source_type"], task["database_host"],
+            str(task["database_port"] or ports[task["source_type"]]),
+            task["database_user"], task["database_name"],
+        )
+        remote = "sh -c " + shlex.quote(DATABASE_DUMP) + " simple-backup " + " ".join(map(shlex.quote, arguments))
+        prefix, _ = self.ssh_program(task)
+        return [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", remote]
+
+    def dump_database(self, task, staging, job):
+        suffix = "rdb" if task["source_type"] == "redis" else "sql"
+        dump = staging / f"{task['source_type']}-{safe_name(task['database_name'] or 'all')}.{suffix}"
+        error_path = staging / ".database-dump-error"
+        environment = os.environ.copy()
+        if task["auth_method"] == "password":
+            environment["SSHPASS"] = self.task_password(task["id"])
+        command = self.database_command(task)
+        job.update(phase="正在导出数据库", progress=0, total_bytes=0)
+        try:
+            with dump.open("wb") as output, error_path.open("wb") as errors:
+                os.chmod(dump, 0o600)
+                os.chmod(error_path, 0o600)
+                process = subprocess.Popen(
+                    command, stdin=subprocess.PIPE, stdout=output, stderr=errors,
+                    start_new_session=True, env=environment,
+                )
+                job["process"] = process
+                process.stdin.write((self.task_database_password(task["id"]) + "\n").encode())
+                process.stdin.close()
+                last_check = last_sample = 0
+                while process.poll() is None:
+                    if job["stop"].is_set():
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except (AttributeError, ProcessLookupError, PermissionError):
+                            process.terminate()
+                    now = time.time()
+                    if now - last_check >= 5:
+                        last_check = now
+                        self.disk_guard(task)
+                    if now - last_sample >= 2:
+                        last_sample = now
+                        self.sample_transfer(staging, task, job)
+                    time.sleep(0.2)
+            self.sample_transfer(staging, task, job)
+            error = error_path.read_text(encoding="utf-8", errors="replace")[-6000:]
+            for line in error.splitlines():
+                self.log(f"database: {line}", "PROCESS", task["id"])
+            return process.returncode, error
+        except FileNotFoundError as exc:
+            return 127, f"本机缺少命令：{command[0]}（{exc}）"
+        finally:
+            job["process"] = None
+            error_path.unlink(missing_ok=True)
 
     def free_space(self, task):
         path = Path(task["backup_dir"])
@@ -626,17 +746,26 @@ class BackupApp:
         root = Path(task["backup_dir"])
         root.mkdir(parents=True, exist_ok=True)
         staging = root / f".partial-{task['id']}"
-        staging.mkdir(exist_ok=True)
-        job["total_bytes"] = self.remote_size(task, job)
-        job["phase"] = "正在下载"
-        job["progress"] = 0
-        job["_sample_time"] = time.time()
-        job["_sample_total"] = directory_size(staging)
-        code, output = self.execute(self.transfer_command(task, staging), task, job, monitor_path=staging)
+        if task["source_type"] == "files":
+            staging.mkdir(exist_ok=True)
+            os.chmod(staging, 0o700)
+            job["total_bytes"] = self.remote_size(task, job)
+            job["phase"] = "正在下载"
+            job["progress"] = 0
+            job["_sample_time"] = time.time()
+            job["_sample_total"] = directory_size(staging)
+            code, output = self.execute(self.transfer_command(task, staging), task, job, monitor_path=staging)
+        else:
+            # ponytail: logical dumps restart on retry; add engine-specific incremental backup only when requested.
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(mode=0o700)
+            job["_sample_time"] = time.time()
+            job["_sample_total"] = 0
+            code, output = self.dump_database(task, staging, job)
         if job["stop"].is_set():
             raise RuntimeError(job.get("reason") or "备份已停止")
         if code:
-            raise RuntimeError(output[-800:] or f"传输程序退出码 {code}")
+            raise RuntimeError(output[-800:] or f"备份程序退出码 {code}")
         job["phase"] = "正在本机压缩"
         job["progress"] = 0
         archive = root / f".archive-{task['id']}.tar.zst"
@@ -652,6 +781,7 @@ class BackupApp:
         self.apply_retention(task)
         final = root / f"{datetime.now():%Y%m%d-%H%M%S}_{backup_prefix(task)}.tar.zst"
         os.replace(archive, final)
+        os.chmod(final, 0o600)
         shutil.rmtree(staging)
         return final, directory_size(final), self.free_space(task)
 
@@ -840,6 +970,9 @@ input[type=checkbox]{{width:auto}}button,.btn{{border:0;border-radius:7px;paddin
 .disk-wrap{{position:relative;text-align:center}}.disk-tip{{display:none;position:absolute;z-index:2;left:50%;transform:translateX(-50%);background:#111827;color:white;padding:10px;border-radius:7px;min-width:240px;white-space:pre-line}}.disk-wrap:hover .disk-tip{{display:block}}
 pre{{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--border);padding:12px;border-radius:8px;max-height:430px;overflow:auto}}
 .progress{{height:12px;background:var(--border);border-radius:999px;overflow:hidden}}.progress>span{{display:block;height:100%;background:#1769aa;transition:width .3s}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;text-align:left;border-bottom:1px solid var(--border)}}.metric{{font-size:26px;margin:8px 0}}
+.queue-list{{display:grid;gap:0}}.queue-item{{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)}}.queue-item time{{color:var(--muted);white-space:nowrap}}details summary{{cursor:pointer;padding-top:10px;color:#1769aa}}
+@media(max-width:640px){{header{{padding:12px 10px}}nav{{gap:12px}}nav b{{width:100%;margin:0}}main{{margin:16px auto;padding:0 10px}}.grid{{grid-template-columns:minmax(0,1fr);gap:16px}}.card{{padding:15px}}main>.card{{margin-top:16px}}input,select{{font-size:16px}}button,.btn{{min-height:42px}}.metric{{font-size:21px}}table{{min-width:620px}}.queue-item{{align-items:flex-start}}.queue-item time{{font-size:13px}}}}
+@media(hover:none){{.disk-tip{{display:block;position:static;transform:none;margin-top:10px;min-width:0}}}}
 </style></head><body><header><nav><b>Simple Backup</b><a href="/">首页</a><a href="/tasks">任务</a>
 <a href="/task">新建任务</a><a href="/logs">日志</a><a href="/settings">设置</a><button type="button" class="theme-icon" id="theme" aria-label="切换主题" title="切换主题">◐</button><a href="/logout">退出</a></nav></header>
 <main>{body}</main><script>document.querySelectorAll('form').forEach(f=>{{
@@ -849,6 +982,8 @@ function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localSto
 tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);
 const am=document.getElementById('auth-method'),ka=document.getElementById('key-auth'),pa=document.getElementById('password-auth');
 function authUI(){{if(!am)return;ka.hidden=am.value!=='key';pa.hidden=am.value!=='password'}}if(am){{am.onchange=authUI;authUI()}}
+const so=document.getElementById('source-type'),fs=document.getElementById('file-source'),ds=document.getElementById('database-source'),ft=document.getElementById('file-threads'),rp=document.getElementById('remote-path'),du=document.getElementById('database-user'),dn=document.getElementById('database-name');
+function sourceUI(){{if(!so)return;let files=so.value==='files',sql=so.value==='mysql'||so.value==='postgresql';fs.hidden=!files;ds.hidden=files;ft.hidden=!files;rp.required=files;du.required=sql;dn.required=sql}}if(so){{so.onchange=sourceUI;sourceUI()}}
 const st=document.getElementById('schedule-times'),sv=document.getElementById('schedule-times-value'),add=document.getElementById('add-time');
 if(st){{add.onclick=()=>{{if(st.querySelectorAll('.schedule-time').length>=24)return;st.insertAdjacentHTML('beforeend','<div class="time-row"><input class="schedule-time" type="time" value="12:00" required><button type="button" class="remove-time secondary" title="删除时间">×</button></div>')}};
 st.onclick=e=>{{if(e.target.classList.contains('remove-time')&&st.querySelectorAll('.schedule-time').length>1)e.target.parentElement.remove()}};
@@ -901,10 +1036,16 @@ st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelector
                 queue.append((stamp, task))
                 stamp = self.next_scheduled(task, state, stamp + 1)
         queue.sort(key=lambda item: item[0])
-        queue_html = "".join(
-            f"<p><b>{self.esc(task['name'])}</b><br><span class='muted'>{datetime.fromtimestamp(stamp).strftime('%Y-%m-%d %H:%M') if stamp else '待安排'}</span></p>"
+        queue_items = [
+            f"<div class='queue-item'><b>{self.esc(task['name'])}</b><time>{datetime.fromtimestamp(stamp).strftime('%Y-%m-%d %H:%M') if stamp else '待安排'}</time></div>"
             for stamp, task in queue[:8]
-        ) or "<p class='muted'>暂无启用的自动任务</p>"
+        ]
+        queue_html = (
+            "<div class='queue-list'>" + "".join(queue_items[:4])
+            + (f"<details><summary>再显示 {len(queue_items) - 4} 项</summary>{''.join(queue_items[4:])}</details>" if len(queue_items) > 4 else "")
+            + "</div>"
+            if queue_items else "<p class='muted'>暂无启用的自动任务</p>"
+        )
         body = f"""<div class="grid">{''.join(disk_cards) or '<section class="card"><h2>备份磁盘</h2><p class="muted">创建任务后显示</p></section>'}
 <section class="card"><h2>当前网速</h2><div class="row"><div style="flex:1"><span class="muted">↓ 下载</span><p class="metric" id="net-rx">计算中…</p></div><div style="flex:1"><span class="muted">↑ 上传</span><p class="metric" id="net-tx">计算中…</p></div></div><p class="muted">统计本机除回环接口外的实时流量</p></section>
 <section class="card"><h2>后续备份队列</h2>{queue_html}</section></div>
@@ -941,10 +1082,15 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
                 if job else
                 f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task['id']}'><button>立即备份</button></form>"
             )
+            if task["source_type"] == "files":
+                source = self.esc(task["remote_path"])
+            else:
+                port = task["database_port"] or {"mysql": 3306, "postgresql": 5432, "redis": 6379}[task["source_type"]]
+                source = self.esc(f"{task['source_type']}://{task['database_host']}:{port}/{task['database_name'] or '整个实例'}")
             cards.append(f"""<section class="card"><h2>{self.esc(task['name'])}</h2>
 <p class="muted">ID {task['id']} · {self.esc(task['remote_user'])}@{self.esc(task['remote_host'])}:{task['remote_port']}</p>
 <p><b>状态：</b>{self.esc(status)}　<b>下次：</b>{next_run}</p>
-<p><b>远程：</b>{self.esc(task['remote_path'])}<br><b>本地：</b>{self.esc(task['backup_dir'])}</p>
+<p><b>来源：</b>{source}<br><b>本地：</b>{self.esc(task['backup_dir'])}</p>
 <p><b>最近备份：</b>{self.esc(state.get('last_backup') or '无')}</p>{error}<div class="row">{action}
 <a class="btn secondary" href="/task/detail?id={task['id']}">详情</a><a class="btn secondary" href="/task?id={task['id']}">编辑</a></div></section>""")
         empty = "<section class='card'><h2>还没有备份任务</h2><p>点击“新建任务”，只需填写服务器和路径即可开始。</p></section>"
@@ -977,6 +1123,7 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
         task_id = self.esc(task.get("id", ""))
         checked = lambda key: "checked" if task.get(key) else ""
         selected = lambda value: "selected" if task.get("auth_method") == value else ""
+        source_selected = lambda value: "selected" if task.get("source_type") == value else ""
         time_inputs = "".join(
             f'<div class="time-row"><input class="schedule-time" type="time" value="{self.esc(value)}" required>'
             '<button type="button" class="remove-time secondary" title="删除时间">×</button></div>'
@@ -997,6 +1144,7 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
         body = f"""<section class="card"><h1>{'编辑任务' if task_id else '新建备份任务'}</h1>
 <form method="post" action="/task/save"><input type="hidden" name="id" value="{task_id}">
 <label>任务名称</label><input name="name" required maxlength="50" value="{self.esc(task['name'])}">
+<label>备份类型</label><select id="source-type" name="source_type"><option value="files" {source_selected('files')}>文件 / 目录</option><option value="mysql" {source_selected('mysql')}>MySQL / MariaDB</option><option value="postgresql" {source_selected('postgresql')}>PostgreSQL</option><option value="redis" {source_selected('redis')}>Redis</option></select>
 <div class="grid"><div><label>远程服务器 IP / 域名</label><input name="remote_host" required value="{self.esc(task['remote_host'])}">
 <label>SSH 端口</label><input name="remote_port" type="number" min="1" max="65535" required value="{task['remote_port']}">
 <label>SSH 用户名</label><input name="remote_user" required value="{self.esc(task['remote_user'])}">
@@ -1006,7 +1154,12 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
 <small class="muted">使用私钥时填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small>
  </div><div id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password">
 <small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div></div>
-<div><label>远程文件或目录</label><input name="remote_path" required value="{self.esc(task['remote_path'])}">
+<div><div id="file-source"><label>远程文件或目录</label><input id="remote-path" name="remote_path" required value="{self.esc(task['remote_path'])}"></div>
+<div id="database-source"><label>数据库地址</label><input name="database_host" value="{self.esc(task['database_host'])}"><small class="muted">这是相对于远程服务器的地址，数据库在同一台机器通常填 127.0.0.1。</small>
+<label>数据库端口</label><input name="database_port" type="number" min="0" max="65535" value="{task['database_port']}"><small class="muted">填 0 自动使用 MySQL 3306、PostgreSQL 5432 或 Redis 6379。</small>
+<label>数据库用户名</label><input id="database-user" name="database_user" maxlength="128" value="{self.esc(task['database_user'])}">
+<label>数据库名称</label><input id="database-name" name="database_name" maxlength="128" value="{self.esc(task['database_name'])}"><small class="muted">MySQL / PostgreSQL 必填；Redis 会备份整个实例，无需填写。</small>
+<label>数据库密码</label><input name="database_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">可留空用于免密连接；编辑时留空表示不修改。密码不会写入普通任务配置或命令行。</small></div>
 <label>本地备份目录</label><input name="backup_dir" required value="{self.esc(task['backup_dir'])}">
 <label>每隔几天备份</label><input name="interval_days" type="number" min="1" max="3650" step="1" required value="{task['interval_days']}">
 <label>在这些时间点备份</label><div id="schedule-times">{time_inputs}</div>
@@ -1015,9 +1168,9 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
 <small class="muted">例如每隔 1 天，设置 02:00 和 14:00，就是每天备份两次。</small>
 <label>最多保留多少份</label><input name="retention_limit" type="number" min="0" required value="{task['retention_limit']}">
 <small class="muted">填 0 表示全部保留，不自动删除。</small>
-<label>并行线程数（1-16）</label><input name="transfer_threads" type="number" min="1" max="16" step="1" required value="{task['transfer_threads']}" oninput="if(+this.value>16)this.value=16;if(+this.value<1)this.value=1"></div></div>
+<div id="file-threads"><label>并行线程数（1-16）</label><input name="transfer_threads" type="number" min="1" max="16" step="1" required value="{task['transfer_threads']}" oninput="if(+this.value>16)this.value=16;if(+this.value<1)this.value=1"></div></div></div>
 <p><label><input type="checkbox" name="enabled" {checked('enabled')}> 启用自动备份</label>
-<label><input type="checkbox" name="auto_install_dependencies" {checked('auto_install_dependencies')}> 首次连接自动安装远端 rsync / SFTP 依赖</label></p>
+<label><input type="checkbox" name="auto_install_dependencies" {checked('auto_install_dependencies')}> 首次连接自动安装对应备份客户端</label></p>
 <button>保存任务</button></form></section>
 {delete_task}<section class="card"><h2>已有备份</h2>{backup_rows or '<p class="muted">暂无备份</p>'}</section>"""
         return self.page("任务设置", body, token)
@@ -1056,11 +1209,12 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
     def save_task_form(self, form):
         task_id = form.get("id", "")
         old = self.task(task_id) if task_id else None
-        raw = {key: form.get(key, "") for key in (
+        raw = {key: form[key] for key in (
             "name", "remote_host", "remote_port", "remote_user", "remote_path", "ssh_key",
             "backup_dir", "interval_days", "retention_limit", "transfer_threads", "auth_method",
-            "schedule_times",
-        )}
+            "schedule_times", "source_type", "database_host", "database_port", "database_user",
+            "database_name",
+        ) if key in form}
         raw["enabled"] = "enabled" in form
         raw["auto_install_dependencies"] = "auto_install_dependencies" in form
         task = validate_task(raw, task_id)
@@ -1069,11 +1223,17 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
             raise ValueError("SSH 密码无效")
         if task["auth_method"] == "password" and not ssh_password and not self.task_password(task_id):
             raise ValueError("选择密码登录时必须填写 SSH 密码")
+        database_password = form.get("database_password", "")
+        if len(database_password) > 512 or any(ord(char) < 32 for char in database_password):
+            raise ValueError("数据库密码不能超过 512 位或包含控制字符")
         with self.lock:
             if old:
                 index = self.config["tasks"].index(old)
                 self.config["tasks"][index] = task
-                connection = ("remote_host", "remote_port", "remote_user", "ssh_key", "auth_method")
+                connection = (
+                    "remote_host", "remote_port", "remote_user", "ssh_key", "auth_method",
+                    "source_type", "database_host", "database_port",
+                )
                 if any(old[k] != task[k] for k in connection):
                     self.task_state(task_id)["dependencies_ready"] = False
             else:
@@ -1090,6 +1250,10 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
                     self.set_task_password(task["id"], ssh_password)
             else:
                 self.set_task_password(task["id"], "")
+            if task["source_type"] == "files":
+                self.set_task_secret(task["id"], "database_password", "")
+            elif database_password:
+                self.set_task_secret(task["id"], "database_password", database_password)
         return task
 
 class Handler(BaseHTTPRequestHandler):
@@ -1289,6 +1453,7 @@ class Handler(BaseHTTPRequestHandler):
             self.app.config["tasks"].remove(task)
             self.app.state["tasks"].pop(task["id"], None)
             self.app.set_task_password(task["id"], "")
+            self.app.set_task_secret(task["id"], "database_password", "")
             self.app._save_config()
             self.app._save_state()
             self.redirect("/")
