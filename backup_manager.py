@@ -19,7 +19,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +41,7 @@ TASK_DEFAULTS = {
     "id": "", "name": "新备份任务", "remote_host": "", "remote_port": 22,
     "remote_user": "root", "remote_path": "/", "ssh_key": "/root/.ssh/id_ed25519",
     "backup_dir": "/var/backups/simple-backup", "interval_days": 3,
+    "schedule_times": ["02:00"],
     "retention_limit": 0, "transfer_threads": 4, "enabled": True,
     "auto_install_dependencies": True, "auth_method": "key",
 }
@@ -89,6 +90,9 @@ def human_size(size):
 
 
 def directory_size(path):
+    path = Path(path)
+    if path.is_file():
+        return path.stat().st_size
     total = 0
     for root, _, files in os.walk(path):
         for name in files:
@@ -115,7 +119,8 @@ def validate_task(raw, existing_id=""):
         task[key] = str(task.get(key, "")).strip()
     try:
         task["remote_port"] = int(task["remote_port"])
-        task["interval_days"] = float(task["interval_days"])
+        old_days = float(task["interval_days"])
+        task["interval_days"] = max(1, round(old_days))
         task["retention_limit"] = int(task["retention_limit"])
         task["transfer_threads"] = int(task["transfer_threads"])
     except (TypeError, ValueError) as exc:
@@ -123,6 +128,16 @@ def validate_task(raw, existing_id=""):
     task["enabled"] = bool(task.get("enabled"))
     task["auto_install_dependencies"] = bool(task.get("auto_install_dependencies"))
     task["auth_method"] = str(task.get("auth_method", "key"))
+    raw_times = task.get("schedule_times") if "schedule_times" in raw else None
+    if not raw_times:
+        if old_days < 1:
+            count = min(24, max(1, round(1 / old_days)))
+            raw_times = [f"{hour:02d}:00" for hour in range(0, 24, max(1, 24 // count))][:count]
+        else:
+            raw_times = ["02:00"]
+    elif isinstance(raw_times, str):
+        raw_times = raw_times.split(",")
+    task["schedule_times"] = sorted(set(str(value).strip() for value in raw_times if str(value).strip()))
     if not re.fullmatch(r"[a-f0-9]{8}", task["id"]):
         raise ValueError("任务 ID 无效")
     if not 1 <= len(task["name"]) <= 50 or any(ord(c) < 32 for c in task["name"]):
@@ -141,8 +156,12 @@ def validate_task(raw, existing_id=""):
         raise ValueError("SSH 认证方式无效")
     if not 1 <= task["remote_port"] <= 65535:
         raise ValueError("SSH 端口必须在 1-65535 之间")
-    if not 0.01 <= task["interval_days"] <= 3650:
-        raise ValueError("备份周期必须在 0.01-3650 天之间")
+    if not 1 <= task["interval_days"] <= 3650:
+        raise ValueError("间隔天数必须在 1-3650 天之间")
+    if not task["schedule_times"] or len(task["schedule_times"]) > 24:
+        raise ValueError("每天需要设置 1-24 个备份时间")
+    if any(not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value) for value in task["schedule_times"]):
+        raise ValueError("备份时间格式无效")
     if task["retention_limit"] < 0:
         raise ValueError("保留份数不能小于 0；0 表示全部保留")
     if not 1 <= task["transfer_threads"] <= 16:
@@ -155,6 +174,8 @@ def migrate_config(config):
     merged.update(config)
     if "tasks" not in config and config.get("remote_host"):
         old = {key: config.get(key, value) for key, value in TASK_DEFAULTS.items() if key != "id"}
+        if "schedule_times" not in config:
+            old.pop("schedule_times", None)
         old.update(id=secrets.token_hex(4), name=config.get("task_name") or f"{config['remote_host']} 备份")
         merged["tasks"] = [validate_task(old)]
     else:
@@ -191,6 +212,7 @@ class BackupApp:
         self.config_path = self.data_dir / "config.json"
         self.state_path = self.data_dir / "state.json"
         self.secrets_dir = self.data_dir / "secrets"
+        self.log_path = self.data_dir / "app.log"
         self.lock = threading.RLock()
         self.config = migrate_config(self._read_json(self.config_path, {}))
         self.state = self._read_json(self.state_path, {"tasks": {}, "telegram_offset": 0, "low_disks": {}})
@@ -225,8 +247,27 @@ class BackupApp:
     def task_state(self, task_id):
         return self.state["tasks"].setdefault(task_id, {
             "next_run": 0, "last_result": "尚未运行", "last_backup": "",
-            "last_error": "", "dependencies_ready": False,
+            "last_error": "", "dependencies_ready": False, "schedule_anchor": "",
         })
+
+    def next_scheduled(self, task, state, after=None):
+        after_dt = datetime.fromtimestamp(after or time.time())
+        try:
+            anchor = datetime.strptime(state.get("schedule_anchor", ""), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            anchor = after_dt.date()
+            state["schedule_anchor"] = anchor.isoformat()
+        days = task["interval_days"]
+        elapsed = max(0, (after_dt.date() - anchor).days)
+        cycle = elapsed // days * days
+        for offset in (cycle, cycle + days, cycle + days * 2):
+            day = anchor + timedelta(days=offset)
+            for clock in task["schedule_times"]:
+                hour, minute = map(int, clock.split(":"))
+                candidate = datetime.combine(day, datetime.min.time()).replace(hour=hour, minute=minute)
+                if candidate > after_dt:
+                    return candidate.timestamp()
+        return (after_dt + timedelta(days=days)).timestamp()
 
     def secret_path(self, task_id):
         return self.secrets_dir / f"{task_id}.json"
@@ -284,20 +325,49 @@ class BackupApp:
         now = time.time()
         self.login_failures.setdefault(address, []).append(now)
         self.account_failures.append(now)
-        print(f"登录失败：来源 {address}，时间 {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
+        self.log(f"登录失败：来源 {address}", "WARN")
 
-    def notify(self, message):
-        token = self.config.get("telegram_bot_token")
-        chat_id = self.config.get("telegram_chat_id")
-        if not token or not chat_id:
-            return
+    def log(self, message, level="INFO"):
+        line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {str(message).replace(chr(13), ' ').replace(chr(10), ' | ')}\n"
+        with self.lock:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            if self.log_path.exists() and self.log_path.stat().st_size > 5 * 1024 * 1024:
+                os.replace(self.log_path, self.log_path.with_suffix(".log.1"))
+            with self.log_path.open("a", encoding="utf-8") as target:
+                target.write(line)
+            os.chmod(self.log_path, 0o600)
+
+    def read_log(self, limit=500_000):
+        try:
+            data = b"".join(
+                path.read_bytes()
+                for path in (self.log_path.with_suffix(".log.1"), self.log_path)
+                if path.exists()
+            )
+            return data[-limit:].decode("utf-8", "replace") if limit else data.decode("utf-8", "replace")
+        except OSError:
+            return "暂无日志"
+
+    @staticmethod
+    def send_telegram(token, chat_id, message):
         try:
             data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode()
             urllib.request.urlopen(
                 f"https://api.telegram.org/bot{token}/sendMessage", data=data, timeout=15
             ).read()
-        except Exception:
-            pass
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    def notify(self, message):
+        self.log(message)
+        token = self.config.get("telegram_bot_token")
+        chat_id = self.config.get("telegram_chat_id")
+        if not token or not chat_id:
+            return
+        ok, error = self.send_telegram(token, chat_id, message)
+        if not ok:
+            self.log(f"Telegram 发送失败：{error}", "ERROR")
 
     def ssh_options(self, task):
         password_auth = task["auth_method"] == "password"
@@ -441,7 +511,11 @@ class BackupApp:
         suffix = "_" + backup_prefix(task)
         try:
             return sorted(
-                [p for p in root.iterdir() if p.is_dir() and p.name.endswith(suffix)],
+                [
+                    p for p in root.iterdir()
+                    if (p.is_dir() and p.name.endswith(suffix))
+                    or (p.is_file() and p.name.endswith(suffix + ".tar.zst"))
+                ],
                 key=lambda p: p.stat().st_mtime,
             )
         except FileNotFoundError:
@@ -454,8 +528,12 @@ class BackupApp:
         items = self.backups(task)
         while len(items) >= limit:
             oldest = items.pop(0)
-            shutil.rmtree(oldest)
+            self.delete_backup(oldest)
             self.notify(f"已删除旧备份：{task['name']} / {oldest.name}")
+
+    @staticmethod
+    def delete_backup(path):
+        path.unlink() if path.is_file() else shutil.rmtree(path)
 
     def backup_once(self, task, job):
         if not self.disk_guard(task):
@@ -474,9 +552,22 @@ class BackupApp:
             raise RuntimeError(job.get("reason") or "备份已停止")
         if code:
             raise RuntimeError(output[-800:] or f"传输程序退出码 {code}")
+        job["phase"] = "正在本机压缩"
+        job["progress"] = 0
+        archive = root / f".archive-{task['id']}.tar.zst"
+        if archive.exists():
+            archive.unlink()
+        code, output = self.execute(["tar", "--zstd", "-cf", str(archive), "-C", str(staging), "."], task, job)
+        if job["stop"].is_set():
+            archive.unlink(missing_ok=True)
+            raise RuntimeError(job.get("reason") or "压缩已停止")
+        if code:
+            archive.unlink(missing_ok=True)
+            raise RuntimeError(output[-800:] or f"本机压缩程序退出码 {code}")
         self.apply_retention(task)
-        final = root / f"{datetime.now():%Y%m%d-%H%M%S}_{backup_prefix(task)}"
-        os.replace(staging, final)
+        final = root / f"{datetime.now():%Y%m%d-%H%M%S}_{backup_prefix(task)}.tar.zst"
+        os.replace(archive, final)
+        shutil.rmtree(staging)
         return final, directory_size(final), self.free_space(task)
 
     def start_backup(self, task_id, source="手动"):
@@ -488,7 +579,7 @@ class BackupApp:
                 return False, "任务正在运行"
             job = {
                 "stop": threading.Event(), "process": None, "progress": 0,
-                "reason": "", "next_progress_notice": 25,
+                "reason": "", "next_progress_notice": 25, "phase": "正在下载",
             }
             self.jobs[task_id] = job
         threading.Thread(target=self._backup_worker, args=(dict(task), job, source), daemon=True).start()
@@ -504,10 +595,9 @@ class BackupApp:
             for attempt in range(1, 7):
                 try:
                     final, size, free = self.backup_once(task, job)
-                    state.update(
-                        last_result="成功", last_backup=final.name, last_error="",
-                        next_run=time.time() + task["interval_days"] * 86400,
-                    )
+                    state.update(last_result="成功", last_backup=final.name, last_error="")
+                    if source == "定时":
+                        state["next_run"] = self.next_scheduled(task, state, time.time() + 1)
                     self._save_state()
                     self.notify(
                         f"备份成功：{task['name']}\n文件名：{final.name}\n大小：{human_size(size)}\n"
@@ -524,10 +614,9 @@ class BackupApp:
                 self._save_state()
                 self.notify(f"备份已停止：{task['name']}\n原因：{error}")
                 return
-            state.update(
-                last_result="失败", last_error=error,
-                next_run=time.time() + task["interval_days"] * 86400,
-            )
+            state.update(last_result="失败", last_error=error)
+            if source == "定时":
+                state["next_run"] = self.next_scheduled(task, state, time.time() + 1)
             self._save_state()
             self.notify(f"备份失败：{task['name']}\n已连续失败 6 次并停止。\n原因：{error}")
         finally:
@@ -539,14 +628,17 @@ class BackupApp:
         while not self.stop_daemon.wait(2):
             now = time.time()
             for task in list(self.config["tasks"]):
-                if not task["enabled"] or task["id"] in self.jobs:
-                    continue
-                state = self.task_state(task["id"])
-                if not state.get("next_run"):
-                    state["next_run"] = now + task["interval_days"] * 86400
-                    self._save_state()
-                elif state["next_run"] <= now and self.disk_guard(task):
-                    self.start_backup(task["id"], "定时")
+                try:
+                    if not task["enabled"] or task["id"] in self.jobs:
+                        continue
+                    state = self.task_state(task["id"])
+                    if not state.get("next_run"):
+                        state["next_run"] = self.next_scheduled(task, state, now)
+                        self._save_state()
+                    elif state["next_run"] <= now and self.disk_guard(task):
+                        self.start_backup(task["id"], "定时")
+                except Exception as exc:
+                    self.log(f"调度任务 {task.get('name', task.get('id'))} 出错：{exc}", "ERROR")
             if now - last_telegram >= 3:
                 last_telegram = now
                 self.poll_telegram()
@@ -625,7 +717,7 @@ class BackupApp:
             task = self.resolve_task(task_ref, allow_single=False)
             allowed = {p.name: p for p in self.backups(task)} if task else {}
             if name in allowed:
-                shutil.rmtree(allowed[name])
+                self.delete_backup(allowed[name])
                 self.notify(f"已删除备份：{task['name']} / {name}")
             else:
                 self.notify("任务或备份文件名不存在")
@@ -646,7 +738,7 @@ class BackupApp:
 html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#33445d;--muted:#aab7ca;--input:#111c2d}}
 @media(prefers-color-scheme:dark){{html[data-theme=auto]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#33445d;--muted:#aab7ca;--input:#111c2d}}}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}}
-header{{background:#17243b;color:white;padding:16px}}nav{{max-width:1100px;margin:auto;display:flex;gap:18px;align-items:center}}
+header{{background:#17243b;color:white;padding:16px}}nav{{max-width:1100px;margin:auto;display:flex;gap:18px;align-items:center;flex-wrap:wrap}}
 nav b{{font-size:20px;margin-right:auto}}a{{color:#1769aa;text-decoration:none}}nav a{{color:white}}
 main{{max-width:1100px;margin:24px auto;padding:0 14px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px}}
 .card{{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;box-shadow:0 3px 12px #2030400d}}
@@ -654,21 +746,100 @@ main{{max-width:1100px;margin:24px auto;padding:0 14px}}.grid{{display:grid;grid
 label{{display:block;margin:12px 0 4px;font-weight:600}}input,select{{width:100%;padding:10px;border:1px solid var(--border);border-radius:7px;background:var(--input);color:var(--fg)}}
 input[type=checkbox]{{width:auto}}button,.btn{{border:0;border-radius:7px;padding:9px 14px;background:#1769aa;color:white;cursor:pointer}}
 .danger{{background:#b42318}}.secondary{{background:#667085}}form.inline{{display:inline}}small{{line-height:1.5}}
-</style></head><body><header><nav><b>Simple Backup</b><a href="/">任务</a>
-<a href="/task">新建任务</a><a href="/settings">设置</a><button type="button" id="theme">主题</button><a href="/logout">退出</a></nav></header>
+.theme-icon{{background:transparent;padding:5px;color:#c9d5e7;display:grid;place-items:center}}.theme-icon:hover{{color:white;background:#ffffff18}}
+.theme-icon svg{{width:20px;height:20px}}.time-row{{display:flex;gap:8px;margin:6px 0}}.time-row input{{margin:0}}.time-row button{{padding:6px 11px}}
+.donut{{width:150px;height:150px;border-radius:50%;display:grid;place-items:center;margin:auto}}.donut:after{{content:'';width:105px;height:105px;border-radius:50%;background:var(--card)}}
+.disk-wrap{{position:relative;text-align:center}}.disk-tip{{display:none;position:absolute;z-index:2;left:50%;transform:translateX(-50%);background:#111827;color:white;padding:10px;border-radius:7px;min-width:240px;white-space:pre-line}}.disk-wrap:hover .disk-tip{{display:block}}
+pre{{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--border);padding:12px;border-radius:8px;max-height:430px;overflow:auto}}
+</style></head><body><header><nav><b>Simple Backup</b><a href="/">首页</a><a href="/tasks">任务</a>
+<a href="/task">新建任务</a><a href="/logs">日志</a><a href="/settings">设置</a><button type="button" class="theme-icon" id="theme" aria-label="切换主题" title="切换主题">
+<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20V2Zm0 18a8 8 0 0 1 0-16v16Z"/></svg></button><a href="/logout">退出</a></nav></header>
 <main>{body}</main><script>document.querySelectorAll('form').forEach(f=>{{
 if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value='{csrf}';f.appendChild(i)}}}});
 const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}};
-function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent='主题：'+tn[t]}}
+function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title)}}
 tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto')}};ts(document.documentElement.dataset.theme);
+const am=document.getElementById('auth-method'),ka=document.getElementById('key-auth'),pa=document.getElementById('password-auth');
+function authUI(){{if(!am)return;ka.hidden=am.value!=='key';pa.hidden=am.value!=='password'}}if(am){{am.onchange=authUI;authUI()}}
+const st=document.getElementById('schedule-times'),sv=document.getElementById('schedule-times-value'),add=document.getElementById('add-time');
+if(st){{add.onclick=()=>{{if(st.querySelectorAll('.schedule-time').length>=24)return;st.insertAdjacentHTML('beforeend','<div class="time-row"><input class="schedule-time" type="time" value="12:00" required><button type="button" class="remove-time secondary" title="删除时间">×</button></div>')}};
+st.onclick=e=>{{if(e.target.classList.contains('remove-time')&&st.querySelectorAll('.schedule-time').length>1)e.target.parentElement.remove()}};
+st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelectorAll('.schedule-time')].map(i=>i.value).filter(Boolean).join(',')}})}}
 </script></body></html>"""
+
+    @staticmethod
+    def network_bytes():
+        try:
+            total = 0
+            for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
+                name, values = line.split(":", 1)
+                fields = values.split()
+                if name.strip() != "lo":
+                    total += int(fields[0]) + int(fields[8])
+            return total
+        except (OSError, ValueError, IndexError):
+            return 0
+
+    def home_html(self, token):
+        disks = {}
+        for task in self.config["tasks"]:
+            path = Path(task["backup_dir"])
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                device = os.stat(path).st_dev
+                entry = disks.setdefault(device, {"path": str(path), "usage": shutil.disk_usage(path), "tasks": []})
+                size = sum(directory_size(item) for item in self.backups(task))
+                entry["tasks"].append((task["name"], size))
+            except OSError as exc:
+                self.log(f"读取磁盘信息失败：{path}：{exc}", "ERROR")
+        disk_cards = []
+        for entry in disks.values():
+            usage = entry["usage"]
+            used = usage.total - usage.free
+            percent = round(used / usage.total * 100, 1) if usage.total else 0
+            details = "\n".join(f"{name}：{human_size(size)}" for name, size in entry["tasks"]) or "暂无任务备份"
+            disk_cards.append(f"""<section class="card disk-wrap"><h2>备份磁盘</h2>
+<div class="donut" style="background:conic-gradient(#1769aa {percent}%,var(--border) 0)"></div>
+<p><b>{percent}%</b> · 已用 {human_size(used)} / {human_size(usage.total)}<br><span class="muted">{self.esc(entry['path'])}</span></p>
+<div class="disk-tip">{self.esc(details)}</div></section>""")
+        queue = []
+        for task in self.config["tasks"]:
+            if not task["enabled"]:
+                continue
+            state = self.task_state(task["id"])
+            stamp = state.get("next_run") or self.next_scheduled(task, state)
+            for _ in range(4):
+                queue.append((stamp, task))
+                stamp = self.next_scheduled(task, state, stamp + 1)
+        queue.sort(key=lambda item: item[0])
+        queue_html = "".join(
+            f"<p><b>{self.esc(task['name'])}</b><br><span class='muted'>{datetime.fromtimestamp(stamp).strftime('%Y-%m-%d %H:%M') if stamp else '待安排'}</span></p>"
+            for stamp, task in queue[:8]
+        ) or "<p class='muted'>暂无启用的自动任务</p>"
+        body = f"""<div class="grid">{''.join(disk_cards) or '<section class="card"><h2>备份磁盘</h2><p class="muted">创建任务后显示</p></section>'}
+<section class="card"><h2>当前总网速</h2><p id="net-speed" style="font-size:28px">计算中…</p><p class="muted">统计本机除回环接口外的收发总和</p></section>
+<section class="card"><h2>后续备份队列</h2>{queue_html}</section></div>
+<section class="card"><h2>正在运行</h2><div id="running">读取中…</div></section>
+<section class="card"><div class="row"><h2 style="margin-right:auto">最近重要日志</h2><a href="/logs">查看完整日志</a></div>
+<pre>{self.esc(self.read_log(40_000))}</pre></section>
+<script>let nb=0,nt=0;async function live(){{let r=await fetch('/api/status'),d=await r.json(),now=Date.now();
+if(nb)document.getElementById('net-speed').textContent=(Math.max(0,d.network_bytes-nb)/1024/1024/((now-nt)/1000)).toFixed(2)+' MB/s';
+nb=d.network_bytes;nt=now;let box=document.getElementById('running');box.replaceChildren();
+if(d.running.length)d.running.forEach(x=>{{let p=document.createElement('p'),b=document.createElement('b');b.textContent=x.name;p.append(b,' · '+x.phase+' · '+x.progress+'%');box.append(p)}});
+else{{let p=document.createElement('p');p.className='muted';p.textContent='当前没有运行中的备份';box.append(p)}}}}
+live();setInterval(live,2000);</script>"""
+        return self.page("首页", body, token)
+
+    def logs_html(self, token):
+        return self.page("日志", f"""<section class="card"><div class="row"><h1 style="margin-right:auto">应用日志</h1>
+<a class="btn secondary" href="/logs/raw">下载当前日志</a></div><pre>{self.esc(self.read_log())}</pre></section>""", token)
 
     def dashboard_html(self, token):
         cards = []
         for task in self.config["tasks"]:
             state = self.task_state(task["id"])
             job = self.jobs.get(task["id"])
-            status = f"运行中 {job['progress']}%" if job else state.get("last_result", "尚未运行")
+            status = f"{job.get('phase', '运行中')} {job['progress']}%" if job else state.get("last_result", "尚未运行")
             next_run = datetime.fromtimestamp(state["next_run"]).strftime("%Y-%m-%d %H:%M") if state.get("next_run") else "待安排"
             error = f"<p class='bad'>原因：{self.esc(state.get('last_error'))}</p>" if state.get("last_error") else ""
             action = (
@@ -690,6 +861,11 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
         task_id = self.esc(task.get("id", ""))
         checked = lambda key: "checked" if task.get(key) else ""
         selected = lambda value: "selected" if task.get("auth_method") == value else ""
+        time_inputs = "".join(
+            f'<div class="time-row"><input class="schedule-time" type="time" value="{self.esc(value)}" required>'
+            '<button type="button" class="remove-time secondary" title="删除时间">×</button></div>'
+            for value in task["schedule_times"]
+        )
         backups = self.backups(task) if task.get("id") else []
         backup_rows = "".join(
             f"<div class='row'><code>{self.esc(p.name)}</code><span class='muted'>{human_size(directory_size(p))}</span>"
@@ -708,18 +884,22 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
 <div class="grid"><div><label>远程服务器 IP / 域名</label><input name="remote_host" required value="{self.esc(task['remote_host'])}">
 <label>SSH 端口</label><input name="remote_port" type="number" min="1" max="65535" required value="{task['remote_port']}">
 <label>SSH 用户名</label><input name="remote_user" required value="{self.esc(task['remote_user'])}">
-<label>SSH 登录方式</label><select name="auth_method"><option value="key" {selected('key')}>SSH 私钥</option>
+<label>SSH 登录方式</label><select id="auth-method" name="auth_method"><option value="key" {selected('key')}>SSH 私钥</option>
 <option value="password" {selected('password')}>SSH 密码</option></select>
-<label>SSH 私钥路径</label><input name="ssh_key" value="{self.esc(task['ssh_key'])}">
+<div id="key-auth"><label>SSH 私钥路径</label><input name="ssh_key" value="{self.esc(task['ssh_key'])}">
 <small class="muted">使用私钥时填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small>
-<label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password">
-<small class="muted">使用密码登录时填写；编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div>
+ </div><div id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password">
+<small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div></div>
 <div><label>远程文件或目录</label><input name="remote_path" required value="{self.esc(task['remote_path'])}">
 <label>本地备份目录</label><input name="backup_dir" required value="{self.esc(task['backup_dir'])}">
-<label>每隔几天备份一次</label><input name="interval_days" type="number" min="0.01" max="3650" step="0.01" required value="{task['interval_days']}">
+<label>每隔几天备份</label><input name="interval_days" type="number" min="1" max="3650" step="1" required value="{task['interval_days']}">
+<label>在这些时间点备份</label><div id="schedule-times">{time_inputs}</div>
+<button type="button" class="secondary" id="add-time">＋ 添加时间</button>
+<input type="hidden" id="schedule-times-value" name="schedule_times">
+<small class="muted">例如每隔 1 天，设置 02:00 和 14:00，就是每天备份两次。</small>
 <label>最多保留多少份</label><input name="retention_limit" type="number" min="0" required value="{task['retention_limit']}">
 <small class="muted">填 0 表示全部保留，不自动删除。</small>
-<label>并行线程数</label><input name="transfer_threads" type="number" min="1" max="16" required value="{task['transfer_threads']}"></div></div>
+<label>并行线程数（1-16）</label><input name="transfer_threads" type="number" min="1" max="16" step="1" required value="{task['transfer_threads']}" oninput="if(+this.value>16)this.value=16;if(+this.value<1)this.value=1"></div></div>
 <p><label><input type="checkbox" name="enabled" {checked('enabled')}> 启用自动备份</label>
 <label><input type="checkbox" name="auto_install_dependencies" {checked('auto_install_dependencies')}> 首次连接自动安装远端 rsync / SFTP 依赖</label></p>
 <button>保存任务</button></form></section>
@@ -733,7 +913,7 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
 <small class="muted">不修改请留空；新密码至少 10 位。</small>
 <label>Telegram Bot Token</label><input name="telegram_bot_token" value="{self.esc(self.config.get('telegram_bot_token', ''))}">
 <label>Telegram Chat ID</label><input name="telegram_chat_id" value="{self.esc(self.config.get('telegram_chat_id', ''))}">
-<p><button>保存设置</button></p></form></section>"""
+<p class="row"><button>保存设置</button><button class="secondary" formaction="/telegram/test">发送 Telegram 测试消息</button></p></form></section>"""
         return self.page("设置", body, token)
 
     @staticmethod
@@ -748,13 +928,13 @@ html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#43536a
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);font:15px system-ui;color:var(--fg);display:grid;place-items:center;min-height:100vh}}
 .login{{width:min(390px,calc(100% - 28px));background:var(--card);padding:30px;border-radius:14px;box-shadow:0 12px 36px #17243b24}}
 input{{width:100%;padding:12px;margin:6px 0 16px;border:1px solid var(--border);border-radius:8px;background:var(--input);color:var(--fg)}}button{{width:100%;padding:12px;border:0;border-radius:8px;background:#1769aa;color:white}}
-.theme{{position:fixed;right:16px;top:16px;width:auto;padding:8px 12px}}.bad{{color:#e04444}}</style></head><body>
-<button type="button" class="theme" id="theme">主题</button><form class="login" method="post" action="/login">
+.theme{{position:fixed;right:16px;top:16px;width:auto;padding:7px;background:transparent;color:var(--fg)}}.theme svg{{width:20px;height:20px;display:block}}.bad{{color:#e04444}}</style></head><body>
+<button type="button" class="theme" id="theme" aria-label="切换主题" title="切换主题"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 0 0 20V2Zm0 18a8 8 0 0 1 0-16v16Z"/></svg></button><form class="login" method="post" action="/login">
 <h1>Simple Backup</h1><p>登录备份管理面板</p>{alert}<label>用户名</label>
 <input name="username" required autofocus autocomplete="username"><label>密码</label>
 <input name="password" type="password" required maxlength="256" autocomplete="current-password"><button>登录</button>
 </form><script>const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}};
-function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent='主题：'+tn[t]}}
+function ts(t){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title)}}
 tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto')}};ts(document.documentElement.dataset.theme);</script></body></html>"""
 
     def save_task_form(self, form):
@@ -763,6 +943,7 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
         raw = {key: form.get(key, "") for key in (
             "name", "remote_host", "remote_port", "remote_user", "remote_path", "ssh_key",
             "backup_dir", "interval_days", "retention_limit", "transfer_threads", "auth_method",
+            "schedule_times",
         )}
         raw["enabled"] = "enabled" in form
         raw["auto_install_dependencies"] = "auto_install_dependencies" in form
@@ -784,7 +965,8 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
                     task["id"] = secrets.token_hex(4)
                 self.config["tasks"].append(task)
             state = self.task_state(task["id"])
-            state["next_run"] = time.time() + task["interval_days"] * 86400
+            state["schedule_anchor"] = datetime.now().date().isoformat()
+            state["next_run"] = self.next_scheduled(task, state)
             self._save_config()
             self._save_state()
             if task["auth_method"] == "password":
@@ -815,6 +997,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_data(self, data, content_type):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Strict-Transport-Security", "max-age=31536000")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(data)
 
@@ -875,12 +1070,30 @@ class Handler(BaseHTTPRequestHandler):
         token = self.session_token()
         query = urllib.parse.parse_qs(path.query)
         if path.path == "/":
+            self.send_html(self.app.home_html(token))
+        elif path.path == "/tasks":
             self.send_html(self.app.dashboard_html(token))
         elif path.path == "/task":
             task = self.app.task(query.get("id", [""])[0])
             self.send_html(self.app.task_form_html(task, token))
         elif path.path == "/settings":
             self.send_html(self.app.settings_html(token))
+        elif path.path == "/logs":
+            self.send_html(self.app.logs_html(token))
+        elif path.path == "/logs/raw":
+            self.send_data(self.app.read_log(None), "text/plain; charset=utf-8")
+        elif path.path == "/api/status":
+            running = [
+                {
+                    "id": task_id, "name": self.app.task(task_id)["name"],
+                    "phase": job.get("phase", "运行中"), "progress": job.get("progress", 0),
+                }
+                for task_id, job in list(self.app.jobs.items()) if self.app.task(task_id)
+            ]
+            self.send_data(
+                json.dumps({"network_bytes": self.app.network_bytes(), "running": running}),
+                "application/json; charset=utf-8",
+            )
         else:
             self.send_html(self.app.page("未找到", "<section class='card'><h1>页面不存在</h1></section>", token), 404)
 
@@ -897,6 +1110,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.handle_action(form)
         except (ValueError, OSError) as exc:
+            self.app.log(f"网页操作失败 {self.path}：{exc}", "ERROR")
             token = self.session_token()
             self.send_html(self.app.page("操作失败", f"<section class='card'><h1>操作失败</h1><p class='bad'>{html.escape(str(exc))}</p></section>", token), 400)
 
@@ -966,7 +1180,7 @@ class Handler(BaseHTTPRequestHandler):
             target = allowed.get(form.get("name", ""))
             if not target:
                 raise ValueError("备份不存在")
-            shutil.rmtree(target)
+            self.app.delete_backup(target)
             self.app.notify(f"已删除备份：{task['name']} / {target.name}")
             self.redirect(f"/task?id={task['id']}")
         elif path == "/settings":
@@ -986,6 +1200,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.redirect("/login", "sb_session=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
             else:
                 self.redirect("/settings")
+        elif path == "/telegram/test":
+            token = form.get("telegram_bot_token", "").strip()
+            chat_id = form.get("telegram_chat_id", "").strip()
+            if not token or not chat_id:
+                raise ValueError("请先填写 Bot Token 和 Chat ID")
+            ok, error = self.app.send_telegram(token, chat_id, "Simple Backup 测试成功：Telegram 通知配置正确。")
+            if not ok:
+                self.app.log(f"Telegram 测试失败：{error}", "ERROR")
+                raise ValueError("Telegram 测试失败：" + error)
+            self.app.log("Telegram 测试消息发送成功")
+            self.send_html(self.app.page(
+                "测试成功",
+                "<section class='card'><h1>Telegram 测试成功</h1><p>请检查机器人发来的测试消息。</p><a class='btn' href='/settings'>返回设置</a></section>",
+                self.session_token(),
+            ))
         else:
             raise ValueError("未知操作")
 
@@ -1017,6 +1246,7 @@ def serve(app):
     context.load_cert_chain(cert, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=app.scheduler_loop, daemon=True).start()
+    app.log(f"服务启动：HTTPS {app.config['listen_host']}:{app.config['listen_port']}")
     try:
         server.serve_forever()
     finally:

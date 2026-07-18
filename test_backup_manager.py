@@ -1,6 +1,8 @@
 import json
 import tempfile
+import threading
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from backup_manager import (
@@ -39,6 +41,9 @@ class BackupManagerTest(unittest.TestCase):
             app.apply_retention(task)
             self.assertEqual([p.name for p in app.backups(task)], [f"20260102-010101_{suffix}"])
             self.assertTrue(unrelated.is_dir())
+            archive = Path(task["backup_dir"]) / f"20260103-010101_{suffix}.tar.zst"
+            archive.write_bytes(b"archive")
+            self.assertIn(archive, app.backups(task))
 
             lftp = app.transfer_command(task, root / "partial")
             self.assertEqual(lftp[0], "lftp")
@@ -51,23 +56,44 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("sshpass -e ssh", app.transfer_command(password_task, root / "partial")[2])
             self.assertEqual(human_size(3 * 1024 ** 3), "3.0 GB")
 
+            compressed_task = sample_task(root / "compressed", id="b1b2c3d4", retention_limit=0)
+            app.remote_setup = lambda *_: None
+            app.disk_guard = lambda *_: True
+            app.free_space = lambda *_: 10 * 1024 ** 3
+            def fake_execute(command, *_args, **_kwargs):
+                if command[0] == "lftp":
+                    partial = Path(compressed_task["backup_dir"]) / f".partial-{compressed_task['id']}"
+                    (partial / "downloaded.txt").write_text("data", encoding="utf-8")
+                elif command[0] == "tar":
+                    Path(command[3]).write_bytes(b"zstd")
+                return 0, ""
+            app.execute = fake_execute
+            final, size, _ = app.backup_once(
+                compressed_task,
+                {"stop": threading.Event(), "phase": "", "progress": 0},
+            )
+            self.assertTrue(final.name.endswith(".tar.zst"))
+            self.assertEqual(size, 4)
+            self.assertFalse((Path(compressed_task["backup_dir"]) / f".partial-{compressed_task['id']}").exists())
+
     def test_validation_migration_credentials_and_sessions(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             for change in (
                 {"remote_host": "bad host;rm"}, {"backup_dir": "/"},
-                {"transfer_threads": 17}, {"remote_path": "relative"},
+                {"transfer_threads": 16999}, {"remote_path": "relative"},
             ):
                 with self.assertRaises(ValueError):
                     sample_task(root / "backup", **change)
 
             old = {
                 "remote_host": "old.example.com", "remote_path": "/old",
-                "backup_dir": str(root / "old-backups"), "ssh_key": "",
+                "backup_dir": str(root / "old-backups"), "ssh_key": "", "interval_days": 0.5,
             }
             migrated = migrate_config(old)
             self.assertEqual(len(migrated["tasks"]), 1)
             self.assertEqual(migrated["tasks"][0]["remote_host"], "old.example.com")
+            self.assertEqual(migrated["tasks"][0]["schedule_times"], ["00:00", "12:00"])
 
             app = BackupApp(root / "data")
             initialize(app, "panel-user", "a-secure-password", 9443, "0.0.0.0", "/c", "/k")
@@ -95,10 +121,23 @@ class BackupManagerTest(unittest.TestCase):
                 app.login_failed("192.0.2.1")
             self.assertFalse(app.login_allowed("192.0.2.1"))
 
+            scheduled = sample_task(
+                root / "scheduled", interval_days=1, schedule_times=["02:00", "14:00"]
+            )
+            state = {"schedule_anchor": "2026-07-18"}
+            first = app.next_scheduled(scheduled, state, datetime(2026, 7, 18, 10).timestamp())
+            second = app.next_scheduled(scheduled, state, first + 1)
+            self.assertEqual(datetime.fromtimestamp(first).strftime("%Y-%m-%d %H:%M"), "2026-07-18 14:00")
+            self.assertEqual(datetime.fromtimestamp(second).strftime("%Y-%m-%d %H:%M"), "2026-07-19 02:00")
+            self.assertIn("donut", app.home_html(app.sign_session("panel-user")))
+            self.assertIn('/telegram/test', app.settings_html(app.sign_session("panel-user")))
+
     def test_installer_does_not_overwrite_panel_port(self):
         script = Path("install.sh").read_text(encoding="utf-8")
         self.assertIn('firewall_port=$1', script)
         self.assertNotIn('open_firewall() {\n    port=$1', script)
+        self.assertIn('verify_panel_tls()', script)
+        self.assertIn('tar zstd', script)
 
 
 if __name__ == "__main__":
