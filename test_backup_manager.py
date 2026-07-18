@@ -138,6 +138,8 @@ class BackupManagerTest(unittest.TestCase):
         self.assertNotIn('open_firewall() {\n    port=$1', script)
         self.assertIn('socket.SO_REUSEADDR', script)
         self.assertIn('verify_panel_tls()', script)
+        self.assertIn('2>&1', script)
+        self.assertIn('tls_attempt', script)
         self.assertIn('tar zstd', script)
 
 

@@ -103,12 +103,17 @@ PY
 verify_panel_tls() {
     tls_ip=$1
     tls_port=$2
-    if printf '' | openssl s_client -connect "127.0.0.1:$tls_port" -servername "$tls_ip" \
-        -verify_ip "$tls_ip" -verify_return_error -CApath /etc/ssl/certs 2>/dev/null \
-        | grep -q "Verify return code: 0 (ok)"; then
-        echo "HTTPS 自检通过：证书链可信，且证书包含 IP $tls_ip。"
-        return 0
-    fi
+    tls_attempt=1
+    while [ "$tls_attempt" -le 10 ]; do
+        if printf '' | openssl s_client -connect "127.0.0.1:$tls_port" -servername "$tls_ip" \
+            -verify_ip "$tls_ip" -verify_return_error -CApath /etc/ssl/certs 2>&1 \
+            | grep -Eq "Verification: OK|Verify return code: 0 \(ok\)"; then
+            echo "HTTPS 自检通过：证书链可信，且证书包含 IP $tls_ip。"
+            return 0
+        fi
+        tls_attempt=$((tls_attempt + 1))
+        sleep 1
+    done
     echo "警告：HTTPS 自检未通过。浏览器会显示“不安全”，请检查下面的证书信息和系统时间："
     openssl x509 -in "$CERT" -noout -issuer -dates -ext subjectAltName 2>/dev/null || true
     return 1
