@@ -1073,6 +1073,7 @@ pre{{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1
 <a href="/task">新建任务</a><a href="/logs">日志</a><a href="/settings">设置</a><button type="button" class="theme-icon" id="theme" aria-label="切换主题" title="切换主题">◐</button><a href="/logout">退出</a></nav></header>
 <main>{body}</main><script>document.querySelectorAll('form').forEach(f=>{{
 if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value='{csrf}';f.appendChild(i)}}}});
+document.querySelectorAll('pre.tail-log').forEach(p=>p.scrollTop=p.scrollHeight);
 const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}},ti={{auto:'◐',light:'☀',dark:'☾'}};
 function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent=ti[t];tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title);if(feedback){{tb.classList.remove('changed');void tb.offsetWidth;tb.classList.add('changed');setTimeout(()=>tb.classList.remove('changed'),220)}}}}
 tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);
@@ -1147,7 +1148,7 @@ st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelector
 <section class="card"><h2>后续备份队列</h2>{queue_html}</section></div>
 <section class="card"><h2>正在运行</h2><div id="running">读取中…</div></section>
 <section class="card"><div class="row"><h2 style="margin-right:auto">最近日志</h2><a href="/logs">查看全部完整日志</a></div>
-<pre>{self.esc(self.read_log(40_000))}</pre></section>
+<pre class="tail-log">{self.esc(self.read_log(40_000))}</pre></section>
 <script>let nr=0,nw=0,nt=0;async function live(){{let r=await fetch('/api/status'),d=await r.json(),now=Date.now();
 if(nt){{let seconds=(now-nt)/1000;document.getElementById('net-rx').textContent=(Math.max(0,d.network_rx-nr)/1024/1024/seconds).toFixed(2)+' MB/s';document.getElementById('net-tx').textContent=(Math.max(0,d.network_tx-nw)/1024/1024/seconds).toFixed(2)+' MB/s'}}
 nr=d.network_rx;nw=d.network_tx;nt=now;let box=document.getElementById('running');box.replaceChildren();
@@ -1158,7 +1159,7 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
 
     def logs_html(self, token):
         return self.page("日志", f"""<section class="card"><div class="row"><h1 style="margin-right:auto">全部应用日志</h1>
-<a class="btn secondary" href="/logs/raw">下载全部日志</a></div><p class="muted">包含当前日志和轮转日志，不再只显示最后 500 KB。</p><pre>{self.esc(self.read_log(None))}</pre></section>""", token)
+<a class="btn secondary" href="/logs/raw">下载全部日志</a></div><p class="muted">包含当前日志和轮转日志，打开时自动定位到最新一行。</p><pre class="tail-log">{self.esc(self.read_log(None))}</pre></section>""", token)
 
     def dashboard_html(self, token):
         cards = []
@@ -1213,10 +1214,10 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
 <p id="detail-summary">{progress}% · {human_size(transferred)} / {human_size(total) if total else '总大小暂未取得'}</p><p class="muted" id="detail-plan">并发策略：{plan}</p>
 <p class="muted">多线程模式下显示活跃传输槽位。槽位速度和已传输量来自本地断点文件的实际增长；百分比为整个任务的总体进度。</p></section>
 <section class="card"><h2>活跃传输槽位</h2><div style="overflow:auto"><table><thead><tr><th>槽位</th><th>当前文件</th><th>速度</th><th>已传输</th><th>任务进度</th></tr></thead><tbody id="slot-rows"><tr><td colspan="5" class="muted">暂无活跃传输</td></tr></tbody></table></div></section>
-<section class="card"><div class="row"><h2 style="margin-right:auto">该任务的全部日志</h2><a class="btn secondary" href="/logs">全部应用日志</a></div><pre id="task-log">{self.esc(self.read_task_log(task_id))}</pre></section>
+<section class="card"><div class="row"><h2 style="margin-right:auto">该任务的全部日志</h2><a class="btn secondary" href="/logs">全部应用日志</a></div><pre class="tail-log" id="task-log">{self.esc(self.read_task_log(task_id))}</pre></section>
 <script>const taskId={json.dumps(task_id)};function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}
 async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');document.getElementById('detail-plan').textContent='并发策略：并行文件 '+x.parallel_files+' 个 · 每个文件 '+x.segments_per_file+' 段';if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow();['#'+s.slot,s.name,fmt(s.speed_bps)+'/s',fmt(s.bytes),s.progress+'%'].forEach(v=>{{let td=tr.insertCell();td.textContent=v}})}})}}
-async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURIComponent(taskId));document.getElementById('task-log').textContent=await r.text()}}detail();setInterval(detail,2000);setInterval(taskLog,5000);</script>"""
+async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURIComponent(taskId)),p=document.getElementById('task-log'),t=await r.text(),follow=p.scrollHeight-p.scrollTop-p.clientHeight<40;p.textContent=t;if(follow)p.scrollTop=p.scrollHeight}}detail();setInterval(detail,2000);setInterval(taskLog,5000);</script>"""
         return self.page("任务详情", body, token)
 
     def task_form_html(self, task, token):
