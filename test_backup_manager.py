@@ -48,29 +48,36 @@ class BackupManagerTest(unittest.TestCase):
             archive.write_bytes(b"archive")
             self.assertIn(archive, app.backups(task))
 
-            lftp = app.transfer_command(task, root / "partial", 100)
-            self.assertEqual(lftp[0], "lftp")
-            self.assertIn("--parallel=4", lftp[2])
-            self.assertNotIn("--use-pget-n", lftp[2])
-            self.assertIn("mirror:parallel-directories true", lftp[2])
-            self.assertIn("--scan-all-first", lftp[2])
-            self.assertIn("--delete-first", lftp[2])
-            self.assertNotIn("--loop", lftp[2])
-            large = app.transfer_command(task, root / "partial", 1)
-            self.assertIn("--parallel=1 --use-pget-n=4", large[2])
-            mixed = app.transfer_command(task, root / "partial", 2)
-            self.assertIn("--parallel=2 --use-pget-n=2", mixed[2])
-            rsync = app.transfer_command({**task, "transfer_threads": 1}, root / "partial")
+            chunk = root / "files.chunk.0"
+            chunk.write_bytes(b"./mail/cur/message\0")
+            rsync = app.transfer_command(task, root / "partial", chunk)
             self.assertEqual(rsync[0], "rsync")
             self.assertIn("--partial", rsync)
-            self.assertIn("--delete-after", rsync)
-            self.assertNotIn("--append-verify", rsync)
-            resume = app.transfer_command(task, root / "partial", 100, True)
-            self.assertEqual(resume[0], "rsync")
-            self.assertIn("--checksum", resume)
+            self.assertIn("--partial-dir=.rsync-partial", rsync)
+            self.assertIn("--from0", rsync)
+            self.assertIn(f"--files-from={chunk}", rsync)
+            self.assertIn("--relative", rsync)
+            self.assertNotIn("--delete-after", rsync)
+            fallback = app.transfer_command(task, root / "partial")
+            self.assertIn("--delete-after", fallback)
+            parallel_staging = root / "parallel-staging"
+            parallel_staging.mkdir()
+            chunks = []
+            for index in range(4):
+                part = root / f"chunk-{index}"
+                part.write_bytes(f"./file-{index}\0".encode())
+                chunks.append(part)
+            calls = []
+            app.scan_remote_manifest = lambda *_: chunks
+            app.execute = lambda command, *_args, **_kwargs: (calls.append(command) or (0, ""))
+            app.transfer_manifest(task, parallel_staging, root / "state", {"progress": 0})
+            self.assertEqual(len(calls), 4)
+            self.assertEqual({next(arg for arg in call if arg.startswith("--files-from=")) for call in calls}, {
+                f"--files-from={chunk}" for chunk in chunks
+            })
             password_task = {**task, "auth_method": "password"}
             app.set_task_password(task["id"], "remote secret")
-            self.assertIn("sshpass -e ssh", app.transfer_command(password_task, root / "partial")[2])
+            self.assertIn("sshpass -e ssh", " ".join(app.transfer_command(password_task, root / "partial")))
             mysql_task = sample_task(
                 root / "mysql", source_type="mysql", database_user="backup",
                 database_name="app", database_port=0,
@@ -87,11 +94,11 @@ class BackupManagerTest(unittest.TestCase):
             app.remote_setup = lambda *_: None
             app.disk_guard = lambda *_: True
             app.free_space = lambda *_: 10 * 1024 ** 3
+            def fake_transfer(_task, partial, _state, _job):
+                (partial / "downloaded.txt").write_text("data", encoding="utf-8")
+            app.transfer_manifest = fake_transfer
             def fake_execute(command, *_args, **_kwargs):
-                if command[0] == "lftp":
-                    partial = Path(compressed_task["backup_dir"]) / f".partial-{compressed_task['id']}"
-                    (partial / "downloaded.txt").write_text("data", encoding="utf-8")
-                elif command[0] == "tar":
+                if command[0] == "tar":
                     Path(command[3]).write_bytes(b"zstd")
                 return 0, ""
             app.execute = fake_execute
@@ -226,8 +233,26 @@ class BackupManagerTest(unittest.TestCase):
             vanished = "mirror: Access failed: No such file (/live/temporary.log)\nmirror: 1 error detected\n"
             self.assertTrue(source_changed_only(vanished))
             self.assertFalse(source_changed_only(vanished + "mirror: Permission denied (/private)\n"))
+            rsync_vanished = (
+                'rsync: [sender] link_stat "/live/gone" failed: No such file or directory (2)\n'
+                'rsync error: some files/attrs were not transferred (see previous errors) (code 23)\n'
+            )
+            self.assertTrue(source_changed_only(rsync_vanished))
             self.assertIn("No such file", command_error(vanished + "Transferring file normal\n", 1))
             self.assertNotIn("error.log", command_error("Transferring file `log/error.log'\n", 1))
+
+            manifest_root = root / "manifest-staging"
+            (manifest_root / "mail" / "cur").mkdir(parents=True)
+            (manifest_root / "mail" / "cur" / "keep").write_text("keep", encoding="utf-8")
+            (manifest_root / "mail" / "cur" / "stale").write_text("stale", encoding="utf-8")
+            (manifest_root / ".rsync-partial").mkdir()
+            (manifest_root / ".rsync-partial" / "part").write_text("part", encoding="utf-8")
+            manifest = root / "manifest.chunk"
+            manifest.write_bytes(b"./mail\0./mail/cur\0./mail/cur/keep\0")
+            app.clean_staging_from_manifest(manifest_root, [manifest])
+            self.assertTrue((manifest_root / "mail" / "cur" / "keep").is_file())
+            self.assertFalse((manifest_root / "mail" / "cur" / "stale").exists())
+            self.assertFalse((manifest_root / ".rsync-partial").exists())
 
             app.config["tasks"].append(progress_task)
             app.log("只属于这个任务", task_id=progress_task["id"])
@@ -279,6 +304,7 @@ class BackupManagerTest(unittest.TestCase):
         self.assertIn('2>&1', script)
         self.assertIn('tls_attempt', script)
         self.assertIn('tar zstd', script)
+        self.assertNotIn(' rsync lftp', script)
 
 
 if __name__ == "__main__":

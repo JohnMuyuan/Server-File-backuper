@@ -2,6 +2,7 @@
 """Simple Backup: multi-task Linux backup daemon and Chinese web panel."""
 
 import argparse
+import concurrent.futures
 import hashlib
 import hmac
 import html
@@ -32,6 +33,7 @@ ERROR_LINE = re.compile(
     r"no such file|not found|timed out|connection (?:reset|closed)|host key|error is not recoverable)"
 )
 VOLATILE_LINE = re.compile(r"(?i)(?:no such file|not found|vanished)")
+RSYNC_SUMMARY_LINE = re.compile(r"(?i)^rsync (?:warning|error): .*\(code (?:23|24)\)")
 DEFAULTS = {
     "tasks": [],
     "telegram_bot_token": "",
@@ -106,7 +108,10 @@ def command_error(output, code):
 
 def source_changed_only(output):
     errors = [line for line in output.splitlines() if ERROR_LINE.search(line)]
-    details = [line for line in errors if not re.search(r"(?i)\b\d+\s+errors?\b", line)]
+    details = [
+        line for line in errors
+        if not re.search(r"(?i)\b\d+\s+errors?\b", line) and not RSYNC_SUMMARY_LINE.search(line)
+    ]
     return bool(details) and all(VOLATILE_LINE.search(line) for line in details)
 
 
@@ -224,10 +229,7 @@ def migrate_config(config):
 REMOTE_SETUP = r'''set -eu
 kind=${1:-files}
 if [ "$kind" = files ]; then
-  has_sftp=0
-  for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/openssh/sftp-server; do [ -x "$p" ] && has_sftp=1; done
-  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null | grep -Eq '^subsystem sftp (internal-sftp|/)' && has_sftp=1 || true
-  command -v rsync >/dev/null 2>&1 && [ "$has_sftp" -eq 1 ] && exit 0
+  command -v rsync >/dev/null 2>&1 && exit 0
 elif [ "$kind" = mysql ]; then
   if command -v mysqldump >/dev/null 2>&1 || command -v mariadb-dump >/dev/null 2>&1; then exit 0; fi
 elif [ "$kind" = postgresql ]; then
@@ -239,7 +241,7 @@ if [ "$(id -u)" -eq 0 ]; then run() { "$@"; }
 elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then run() { sudo -n "$@"; }
 else echo "缺少备份客户端，且当前 SSH 用户没有 root 或免密 sudo 权限" >&2; exit 42; fi
 case "$kind" in
-  files) apt_pkg='rsync openssh-sftp-server'; rpm_pkg='rsync openssh-server'; zypp_pkg='rsync openssh'; arch_pkg='rsync openssh'; apk_pkg='rsync openssh-server' ;;
+  files) apt_pkg='rsync'; rpm_pkg='rsync'; zypp_pkg='rsync'; arch_pkg='rsync'; apk_pkg='rsync' ;;
   mysql) apt_pkg='default-mysql-client'; rpm_pkg='mariadb'; zypp_pkg='mariadb-client'; arch_pkg='mariadb-clients'; apk_pkg='mysql-client' ;;
   postgresql) apt_pkg='postgresql-client'; rpm_pkg='postgresql'; zypp_pkg='postgresql'; arch_pkg='postgresql'; apk_pkg='postgresql-client' ;;
   redis) apt_pkg='redis-tools'; rpm_pkg='redis'; zypp_pkg='redis'; arch_pkg='redis'; apk_pkg='redis' ;;
@@ -485,39 +487,156 @@ class BackupApp:
         state["dependencies_ready"] = True
         self._save_state()
 
-    @staticmethod
-    def lftp_quote(value):
-        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
-
-    @staticmethod
-    def transfer_layout(threads, file_count=0):
-        parallel = min(threads, max(1, file_count)) if file_count else threads
-        return parallel, max(1, threads // parallel)
-
-    def transfer_command(self, task, staging, file_count=0, resume=False):
+    def transfer_command(self, task, staging, files_from=None):
         destination = str(staging) + "/"
         _, ssh = self.ssh_program(task)
-        if task["transfer_threads"] == 1 or resume:
-            return [
-                "rsync", "-a", "--partial", *(["--checksum"] if resume else []), "--info=progress2",
-                "--protect-args", "--delete-after", "-e", ssh,
-                f"{task['remote_user']}@{task['remote_host']}:{task['remote_path'].rstrip('/')}/",
-                destination,
-            ]
-        threads = task["transfer_threads"]
-        parallel, segments = self.transfer_layout(threads, file_count)
-        pget = f" --use-pget-n={segments}" if segments > 1 else ""
-        ssh += " -a -x"
-        script = (
-            f"set sftp:connect-program {self.lftp_quote(ssh)}; "
-            "set net:timeout 20; set net:max-retries 5; set net:reconnect-interval-base 3; "
-            "set mirror:parallel-directories true; "
-            f"open {self.lftp_quote('sftp://' + task['remote_user'] + '@' + task['remote_host'])}; "
-            # ponytail: a full pre-scan bounds live trees; filesystem snapshots are required for atomic consistency.
-            f"mirror --verbose --continue --scan-all-first --delete --delete-first --parallel={parallel}{pget} "
-            f"{self.lftp_quote(task['remote_path'])} {self.lftp_quote(destination)}"
+        command = [
+            "rsync", "-a", "--numeric-ids", "--partial", "--partial-dir=.rsync-partial",
+            "--info=progress2", "--protect-args",
+        ]
+        if files_from is not None:
+            command += ["--from0", f"--files-from={files_from}", "--relative"]
+        else:
+            command += ["--delete-after"]
+        return [
+            *command, "-e", ssh,
+            f"{task['remote_user']}@{task['remote_host']}:{task['remote_path'].rstrip('/')}/",
+            destination,
+        ]
+
+    def scan_remote_manifest(self, task, state_dir, job):
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for old in state_dir.glob("files.chunk.*"):
+            old.unlink(missing_ok=True)
+        chunk_paths = [state_dir / f"files.chunk.{index}" for index in range(task["transfer_threads"])]
+        writers = [path.open("wb") for path in chunk_paths]
+        for path in chunk_paths:
+            os.chmod(path, 0o600)
+        error_path = state_dir / "scan.error"
+        prefix, _ = self.ssh_program(task)
+        remote = (
+            f"cd -- {shlex.quote(task['remote_path'])} && "
+            "find . -mindepth 1 \\( -type d -o -type f -o -type l \\) -print0"
         )
-        return ["lftp", "-e", script + "; bye"]
+        command = [
+            *prefix, *self.ssh_options(task),
+            f"{task['remote_user']}@{task['remote_host']}", remote,
+        ]
+        environment = os.environ.copy() if task["auth_method"] == "password" else None
+        if environment is not None:
+            environment["SSHPASS"] = self.task_password(task["id"])
+        process = None
+        buffer = b""
+        count = 0
+
+        def consume(data):
+            nonlocal buffer, count
+            buffer += data
+            entries = buffer.split(b"\0")
+            buffer = entries.pop()
+            for entry in entries:
+                if not entry:
+                    continue
+                writers[count % len(writers)].write(entry + b"\0")
+                count += 1
+
+        job.update(phase="正在扫描并固定本轮远端文件清单", remote_scanned=False)
+        try:
+            with error_path.open("wb") as errors:
+                process = subprocess.Popen(
+                    command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors,
+                    start_new_session=True, env=environment,
+                )
+                job["process"] = process
+                selector = selectors.DefaultSelector()
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while process.poll() is None:
+                    if job["stop"].is_set():
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except (AttributeError, ProcessLookupError, PermissionError):
+                            process.terminate()
+                    for key, _ in selector.select(1):
+                        data = os.read(key.fileobj.fileno(), 65536)
+                        if data:
+                            consume(data)
+                    self.disk_guard(task)
+                consume(process.stdout.read())
+            error = error_path.read_text(encoding="utf-8", errors="replace")[-12000:]
+            for line in error.splitlines():
+                self.log(f"ssh-scan: {line}", "PROCESS", task["id"])
+            if process.returncode:
+                raise RuntimeError(command_error(error, process.returncode))
+            if buffer:
+                raise RuntimeError("远端文件清单格式不完整，请检查 SSH 连接是否中断")
+            for writer in writers:
+                writer.flush()
+            job.update(remote_files=count, remote_scanned=True)
+            return [path for path in chunk_paths if path.stat().st_size]
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"本机缺少命令：{command[0]}（{exc}）") from exc
+        finally:
+            for writer in writers:
+                writer.close()
+            job["process"] = None
+            error_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def clean_staging_from_manifest(staging, chunks):
+        allowed = set()
+        separator = os.sep.encode()
+        for chunk in chunks:
+            for entry in chunk.read_bytes().split(b"\0"):
+                if entry:
+                    relative = entry[2:] if entry.startswith(b"./") else entry
+                    allowed.add(relative.replace(b"/", separator))
+        root = os.fsencode(staging)
+        partial_dir = b".rsync-partial"
+        for current, directories, files in os.walk(root, topdown=False):
+            for name in files:
+                path = os.path.join(current, name)
+                relative = os.path.relpath(path, root)
+                if relative != partial_dir and not relative.startswith(partial_dir + separator) and relative not in allowed:
+                    os.unlink(path)
+            for name in directories:
+                path = os.path.join(current, name)
+                relative = os.path.relpath(path, root)
+                if os.path.islink(path):
+                    if relative not in allowed:
+                        os.unlink(path)
+                elif relative != partial_dir and relative not in allowed:
+                    try:
+                        os.rmdir(path)
+                    except OSError:
+                        pass
+        shutil.rmtree(Path(staging) / ".rsync-partial", ignore_errors=True)
+
+    def transfer_manifest(self, task, staging, state_dir, job):
+        chunks = self.scan_remote_manifest(task, state_dir, job)
+        if not chunks:
+            self.clean_staging_from_manifest(staging, chunks)
+            job.update(progress=100, parallel_files=0, segments_per_file=1)
+            return
+        job.update(
+            phase="正在按固定清单并行下载", parallel_files=len(chunks), segments_per_file=1,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            futures = [
+                pool.submit(
+                    self.execute, self.transfer_command(task, staging, chunk), task, job,
+                    monitor_path=staging, complete_progress=False,
+                )
+                for chunk in chunks
+            ]
+            results = [future.result() for future in futures]
+        failures = [(code, output) for code, output in results if code and not source_changed_only(output)]
+        vanished = [(code, output) for code, output in results if code and source_changed_only(output)]
+        if failures:
+            raise RuntimeError(command_error(failures[0][1], failures[0][0]))
+        if vanished:
+            self.log("扫描后有实时文件已消失，本轮已跳过；不会追踪扫描后新增的文件", "WARN", task["id"])
+        self.clean_staging_from_manifest(staging, chunks)
+        job["progress"] = 100
 
     def database_command(self, task):
         ports = {"mysql": 3306, "postgresql": 5432, "redis": 6379}
@@ -602,6 +721,7 @@ class BackupApp:
     def clear_partial(task):
         root = Path(task["backup_dir"])
         shutil.rmtree(root / f".partial-{task['id']}", ignore_errors=True)
+        shutil.rmtree(root / f".transfer-{task['id']}", ignore_errors=True)
         (root / f".archive-{task['id']}.tar.zst").unlink(missing_ok=True)
 
     def disk_guard(self, task):
@@ -696,7 +816,7 @@ class BackupApp:
                 daemon=True,
             ).start()
 
-    def execute(self, command, task, job, stdin=None, monitor_path=None):
+    def execute(self, command, task, job, stdin=None, monitor_path=None, complete_progress=True):
         environment = None
         if task["auth_method"] == "password":
             environment = os.environ.copy()
@@ -734,11 +854,6 @@ class BackupApp:
                 line = key.fileobj.readline()
                 if not line:
                     continue
-                if command[0] == "lftp":
-                    if "Removing old file " in line:
-                        job["phase"] = "正在清理旧断点"
-                    elif "Transferring file " in line:
-                        job["phase"] = "正在下载"
                 output.append(line)
                 if ERROR_LINE.search(line):
                     errors.append(line.rstrip() + "\n")
@@ -754,7 +869,7 @@ class BackupApp:
                 self.log(f"{command[0]}: {line}", "PROCESS", task["id"])
         if monitor_path is not None:
             self.sample_transfer(monitor_path, task, job)
-            if process.returncode == 0:
+            if process.returncode == 0 and complete_progress:
                 job["progress"] = 100
         job["process"] = None
         detail = "".join(output)[-6000:]
@@ -809,22 +924,19 @@ class BackupApp:
             os.chmod(staging, 0o700)
             resume = any(staging.iterdir())
             job["total_bytes"] = self.remote_size(task, job)
-            parallel, segments = (1, 1) if resume else self.transfer_layout(
-                task["transfer_threads"], job.get("remote_files", 0)
-            )
-            job.update(parallel_files=parallel, segments_per_file=segments)
-            job["phase"] = "正在校验断点并续传" if resume else (
-                "正在扫描远端清单" if task["transfer_threads"] > 1 else "正在下载"
-            )
+            job.update(parallel_files=task["transfer_threads"], segments_per_file=1)
+            job["phase"] = "正在重新扫描并校验断点" if resume else "正在扫描远端清单"
             job["progress"] = 0
             job["_sample_time"] = time.time()
             job["_sample_total"] = 0
             self.sample_transfer(staging, task, job)
             job.update(speed_bps=0, slots=[])
-            code, output = self.execute(
-                self.transfer_command(task, staging, job.get("remote_files", 0), resume),
-                task, job, monitor_path=staging,
-            )
+            state_dir = root / f".transfer-{task['id']}"
+            try:
+                self.transfer_manifest(task, staging, state_dir, job)
+                code, output = 0, ""
+            finally:
+                shutil.rmtree(state_dir, ignore_errors=True)
         else:
             # ponytail: logical dumps restart on retry; add engine-specific incremental backup only when requested.
             shutil.rmtree(staging, ignore_errors=True)
@@ -835,10 +947,7 @@ class BackupApp:
         if job["stop"].is_set():
             raise RuntimeError(job.get("reason") or "备份已停止")
         if code:
-            if task["source_type"] == "files" and job.get("remote_scanned") and source_changed_only(output):
-                self.log("远端文件在扫描后已消失，按实时目录变化跳过并继续生成备份", "WARN", task["id"])
-            else:
-                raise RuntimeError(command_error(output, code))
+            raise RuntimeError(command_error(output, code))
         job["phase"] = "正在本机压缩"
         job["progress"] = 0
         archive = root / f".archive-{task['id']}.tar.zst"
@@ -1208,7 +1317,7 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
         progress = job.get("progress", 0) if job else 0
         transferred = job.get("transferred_bytes", 0) if job else 0
         total = job.get("total_bytes", 0) if job else 0
-        plan = f"并行文件 {job.get('parallel_files', 1)} 个 · 每个文件 {job.get('segments_per_file', 1)} 段" if job else "等待任务开始"
+        plan = f"并行连接 {job.get('parallel_files', 1)} 条 · 固定清单传输" if job else "等待任务开始"
         body = f"""<section class="card"><div class="row"><div style="margin-right:auto"><h1>{self.esc(task['name'])}</h1>
 <p class="muted">任务 ID {task_id} · {self.esc(task['remote_user'])}@{self.esc(task['remote_host'])}</p></div><a class="btn secondary" href="/task?id={task_id}">编辑</a></div>
 <h2 id="detail-phase">{self.esc(phase)}</h2><div class="progress"><span id="detail-bar" style="width:{progress}%"></span></div>
@@ -1217,7 +1326,7 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
 <section class="card"><h2>活跃传输槽位</h2><div style="overflow:auto"><table><thead><tr><th>槽位</th><th>当前文件</th><th>速度</th><th>已传输</th><th>任务进度</th></tr></thead><tbody id="slot-rows"><tr><td colspan="5" class="muted">暂无活跃传输</td></tr></tbody></table></div></section>
 <section class="card"><div class="row"><h2 style="margin-right:auto">该任务的全部日志</h2><a class="btn secondary" href="/logs">全部应用日志</a></div><pre class="tail-log" id="task-log">{self.esc(self.read_task_log(task_id))}</pre></section>
 <script>const taskId={json.dumps(task_id)};function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}
-async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');document.getElementById('detail-plan').textContent='并发策略：并行文件 '+x.parallel_files+' 个 · 每个文件 '+x.segments_per_file+' 段';if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow();['#'+s.slot,s.name,fmt(s.speed_bps)+'/s',fmt(s.bytes),s.progress+'%'].forEach(v=>{{let td=tr.insertCell();td.textContent=v}})}})}}
+async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');document.getElementById('detail-plan').textContent='并发策略：'+x.parallel_files+' 条 rsync 连接 · 固定清单传输';if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow();['#'+s.slot,s.name,fmt(s.speed_bps)+'/s',fmt(s.bytes),s.progress+'%'].forEach(v=>{{let td=tr.insertCell();td.textContent=v}})}})}}
 async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURIComponent(taskId)),p=document.getElementById('task-log'),t=await r.text(),follow=p.scrollHeight-p.scrollTop-p.clientHeight<40;p.textContent=t;if(follow)p.scrollTop=p.scrollHeight}}detail();setInterval(detail,2000);setInterval(taskLog,5000);</script>"""
         return self.page("任务详情", body, token)
 
