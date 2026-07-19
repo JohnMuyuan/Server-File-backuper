@@ -10,7 +10,7 @@ from pathlib import Path
 from backup_manager import (
     BackupApp, Handler, TASK_DEFAULTS, backup_prefix, human_size, initialize,
     command_error, migrate_config, password_fields, source_changed_only,
-    validate_task, verify_password,
+    serve, validate_task, verify_password,
 )
 
 
@@ -151,6 +151,14 @@ class BackupManagerTest(unittest.TestCase):
             self.assertFalse(app.verify_session(token + "x"))
             saved = json.loads((root / "data" / "config.json").read_text(encoding="utf-8"))
             self.assertEqual((saved["admin_username"], saved["listen_port"]), ("panel-user", 9443))
+
+            proxy_app = BackupApp(root / "proxy-data")
+            initialize(proxy_app, "proxy-user", "a-secure-password", 8088, "0.0.0.0", tls_enabled=False)
+            self.assertFalse(proxy_app.config["tls_enabled"])
+            self.assertEqual(proxy_app.config["listen_host"], "127.0.0.1")
+            proxy_app.config["listen_host"] = "0.0.0.0"
+            with self.assertRaises(SystemExit):
+                serve(proxy_app)
 
             form = {
                 "name": "密码服务器", "remote_host": "pw.example.com", "remote_port": "22",
@@ -330,6 +338,9 @@ class BackupManagerTest(unittest.TestCase):
         self.assertIn('--alpn --tlsport 443', script)
         self.assertIn('--nginx', script)
         self.assertIn('--apache', script)
+        self.assertIn('SB_REVERSE_PROXY', script)
+        self.assertIn('--host "127.0.0.1" --no-tls', script)
+        self.assertIn('当前由 1Panel 管理 HTTPS', script)
         self.assertNotIn('port_free 80 || {', script)
         self.assertIn('tar zstd', script)
         self.assertNotIn(' rsync lftp', script)

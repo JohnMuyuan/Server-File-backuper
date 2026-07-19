@@ -41,6 +41,7 @@ DEFAULTS = {
     "admin_username": "admin",
     "listen_host": "0.0.0.0",
     "listen_port": 8088,
+    "tls_enabled": True,
     "tls_cert": "/var/lib/simple-backup/server.crt",
     "tls_key": "/var/lib/simple-backup/server.key",
     "session_secret": "",
@@ -1738,12 +1739,15 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("未知操作")
 
 
-def initialize(app, username, password, port, host=None, cert=None, key=None):
+def initialize(app, username, password, port, host=None, cert=None, key=None, tls_enabled=True):
     if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,50}", username):
         raise ValueError("用户名格式无效")
     app.config["admin_username"] = username
     app.config["listen_port"] = int(port)
-    if host:
+    app.config["tls_enabled"] = bool(tls_enabled)
+    if not tls_enabled:
+        app.config["listen_host"] = "127.0.0.1"
+    elif host:
         app.config["listen_host"] = host
     if cert:
         app.config["tls_cert"] = cert
@@ -1756,17 +1760,22 @@ def initialize(app, username, password, port, host=None, cert=None, key=None):
 
 def serve(app):
     cert, key = app.config["tls_cert"], app.config["tls_key"]
-    if not Path(cert).is_file() or not Path(key).is_file():
+    tls_enabled = app.config.get("tls_enabled", True)
+    if tls_enabled and (not Path(cert).is_file() or not Path(key).is_file()):
         raise SystemExit("HTTPS 证书不存在，请重新运行安装器申请 IP 证书")
+    if not tls_enabled and app.config["listen_host"] not in ("127.0.0.1", "::1"):
+        raise SystemExit("无内置 HTTPS 时只能监听本机回环地址，请重新运行安装器")
     Handler.app = app
     server = ThreadingHTTPServer((app.config["listen_host"], int(app.config["listen_port"])), Handler)
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(cert, key)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    if tls_enabled:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     resumed = app.resume_interrupted()
     threading.Thread(target=app.scheduler_loop, daemon=True).start()
-    app.log(f"服务启动：HTTPS {app.config['listen_host']}:{app.config['listen_port']}")
+    scheme = "HTTPS" if tls_enabled else "HTTP（仅限本机反向代理）"
+    app.log(f"服务启动：{scheme} {app.config['listen_host']}:{app.config['listen_port']}")
     if resumed:
         app.log(f"服务重启后已自动恢复 {resumed} 个中断任务")
     try:
@@ -1789,10 +1798,11 @@ def main():
     init.add_argument("--host")
     init.add_argument("--cert")
     init.add_argument("--key")
+    init.add_argument("--no-tls", action="store_true")
     args = parser.parse_args()
     app = BackupApp(args.data_dir)
     if args.command == "init":
-        initialize(app, args.username, args.password, args.port, args.host, args.cert, args.key)
+        initialize(app, args.username, args.password, args.port, args.host, args.cert, args.key, not args.no_tls)
     else:
         serve(app)
 

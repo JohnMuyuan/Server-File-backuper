@@ -10,14 +10,17 @@
 bash <(curl -Ls https://raw.githubusercontent.com/JohnMuyuan/Server-File-backuper/main/install.sh)
 ```
 
-安装器会要求填写公网 IPv4、面板端口、用户名和密码，自动安装依赖、配置服务和防火墙，并通过 Let’s Encrypt 申请可自动续期的短期 IP HTTPS 证书。安装和更新结束时会自检证书链与 IP SAN。
+安装器会先询问是否由 1Panel 反向代理并管理 HTTPS。直接回车会继续由 Simple Backup 申请 Let’s Encrypt 短期 IP 证书；输入 `y` 会完全跳过本程序的证书申请，把 HTTPS 交给 1Panel。
 
-申请和续期证书时，公网 IPv4 必须直接指向这台服务器。安装器优先使用 TCP 80；若端口已被网站占用，会依次尝试 TCP 443 TLS-ALPN、Nginx/Apache 无停机校验，也可通过 `SB_ACME_WEBROOT=/网站根目录` 复用现有网站。Webroot 必须是 IP 请求实际命中的站点根目录；使用 1Panel 时需把该网站设为默认站点或绑定公网 IP。安装器会在申请前自动验证。面板始终使用 HTTPS，不会把 SSH 密钥和密码暴露在公网明文 HTTP 中。
+选择 1Panel 模式后，Simple Backup 只监听 `http://127.0.0.1:面板端口`，不会开放该端口到公网。请在 1Panel 创建“反向代理”网站，把代理地址填写为 `http://127.0.0.1:8088`（端口按安装时填写的值），然后在该网站的 HTTPS 设置中选择或申请证书。用户只访问 1Panel 提供的 `https://域名`，不要直接访问本机代理地址。
+
+申请和续期内置证书时，公网 IPv4 必须直接指向这台服务器。安装器优先使用 TCP 80；若端口已被网站占用，会依次尝试 TCP 443 TLS-ALPN、Nginx/Apache 无停机校验，也可通过 `SB_ACME_WEBROOT=/网站根目录` 复用现有网站。Webroot 必须是 IP 请求实际命中的站点根目录；使用 1Panel 时需把该网站设为默认站点或绑定公网 IP。安装器会在申请前自动验证。公网入口始终使用 HTTPS，不会把 SSH 密钥和密码暴露在公网明文 HTTP 中。
 
 非交互安装：
 
 ```bash
 SB_NONINTERACTIVE=1 \
+SB_REVERSE_PROXY=0 \
 SB_PUBLIC_IP='203.0.113.10' \
 SB_PANEL_USER='admin' \
 SB_PANEL_PASSWORD='至少10位密码' \
@@ -25,7 +28,9 @@ SB_PANEL_PORT='8088' \
 bash <(curl -Ls https://raw.githubusercontent.com/JohnMuyuan/Server-File-backuper/main/install.sh)
 ```
 
-完成后访问 `https://公网IP:面板端口`，使用网页内的登录界面进入。
+使用 1Panel 的非交互安装只需设置 `SB_REVERSE_PROXY=1`；此时不需要 `SB_PUBLIC_IP`，也不会申请证书或开放面板端口。
+
+内置证书模式完成后访问 `https://公网IP:面板端口`；1Panel 模式访问在 1Panel 中绑定的 `https://域名`。两种模式都使用网页内的登录界面。
 
 如果 Chrome 仍显示“不安全”，先运行 `simple-backup info` 查看 HTTPS 自检结果，并确认地址栏使用的是证书中的**同一个公网 IP**和 `https://`，设备时间正确，且没有经过会替换证书的代理。点击 Chrome 的证书详情可进一步查看具体错误码。
 

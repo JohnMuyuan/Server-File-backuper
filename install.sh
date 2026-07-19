@@ -316,12 +316,15 @@ install_app() {
     username=${SB_PANEL_USER:-admin}
     password=${SB_PANEL_PASSWORD:-}
     port=${SB_PANEL_PORT:-8088}
+    reverse_proxy=${SB_REVERSE_PROXY:-0}
     if [ "$interactive" = 1 ]; then
         echo "Simple Backup 一键安装"
         username=$(prompt "面板用户名" "$username")
         password=$(secret_prompt "面板密码")
-        port=$(prompt "公网面板端口（不能填 80）" "$port")
+        reverse_proxy=$(prompt "由 1Panel 反向代理并管理 HTTPS，跳过本程序申请证书？(y/N)" "n")
+        port=$(prompt "面板端口（不能填 80）" "$port")
     fi
+    case "$reverse_proxy" in 1|y|Y|yes|YES) reverse_proxy=1 ;; *) reverse_proxy=0 ;; esac
     [ -n "$password" ] || password=$(random_password)
     case "$port" in *[!0-9]*|"") echo "端口必须是数字"; exit 1 ;; esac
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] && [ "$port" -ne 80 ] || {
@@ -329,15 +332,24 @@ install_app() {
     }
     port_free "$port" || { echo "面板端口 $port 已被占用，请更换端口。"; exit 1; }
     download_release
-    issue_ip_certificate
-    python3 "$APP" --data-dir "$DATA_DIR" init --username "$username" --password "$password" \
-        --port "$port" --host "0.0.0.0" --cert "$CERT" --key "$KEY"
-    open_firewall "$port"
-    setup_service
-    ip=$(cat "$IP_FILE")
-    verify_panel_tls "$ip" "$port" || true
-    echo
-    echo "安装完成：https://$ip:$port"
+    if [ "$reverse_proxy" = 1 ]; then
+        python3 "$APP" --data-dir "$DATA_DIR" init --username "$username" --password "$password" \
+            --port "$port" --host "127.0.0.1" --no-tls
+        setup_service
+        echo
+        echo "安装完成：Simple Backup 仅监听 http://127.0.0.1:$port"
+        echo "请在 1Panel 创建反向代理网站，代理地址填写 http://127.0.0.1:$port，并在 1Panel 中启用 HTTPS。"
+    else
+        issue_ip_certificate
+        python3 "$APP" --data-dir "$DATA_DIR" init --username "$username" --password "$password" \
+            --port "$port" --host "0.0.0.0" --cert "$CERT" --key "$KEY"
+        open_firewall "$port"
+        setup_service
+        ip=$(cat "$IP_FILE")
+        verify_panel_tls "$ip" "$port" || true
+        echo
+        echo "安装完成：https://$ip:$port"
+    fi
     echo "管理用户名：$username"
     echo "管理密码：$password"
     echo "请妥善保存密码。以后运行 simple-backup 打开管理菜单。"
@@ -348,7 +360,8 @@ update_app() {
     installed || { install_app; return; }
     install_packages
     download_release
-    if [ ! -s "$CERT" ] || [ ! -s "$KEY" ] || ! openssl x509 -in "$CERT" -issuer -noout 2>/dev/null | grep -qi "Let's Encrypt"; then
+    tls_enabled=$(python3 -c 'import json; print(1 if json.load(open("/var/lib/simple-backup/config.json")).get("tls_enabled",True) else 0)')
+    if [ "$tls_enabled" = 1 ] && { [ ! -s "$CERT" ] || [ ! -s "$KEY" ] || ! openssl x509 -in "$CERT" -issuer -noout 2>/dev/null | grep -qi "Let's Encrypt"; }; then
         issue_ip_certificate
     fi
     current_port=$(python3 -c 'import json; print(json.load(open("/var/lib/simple-backup/config.json")).get("listen_port",8088))')
@@ -366,21 +379,32 @@ with open(temp, "w", encoding="utf-8") as target:
 os.chmod(temp, 0o600)
 os.replace(temp, path)
 PY
-        open_firewall 8088
+        [ "$tls_enabled" != 1 ] || open_firewall 8088
         echo "已修复旧安装器造成的端口错误：面板从 80 迁移到 8088。"
     fi
     setup_service
-    ip=$(cat "$IP_FILE" 2>/dev/null || detect_ip)
     port=$(python3 -c 'import json; print(json.load(open("/var/lib/simple-backup/config.json")).get("listen_port",8088))')
-    verify_panel_tls "$ip" "$port" || true
+    if [ "$tls_enabled" = 1 ]; then
+        ip=$(cat "$IP_FILE" 2>/dev/null || detect_ip)
+        verify_panel_tls "$ip" "$port" || true
+    else
+        echo "1Panel 反向代理地址：http://127.0.0.1:$port"
+    fi
     echo "更新完成。"
 }
 
 panel_info() {
     installed || { echo "尚未安装"; return; }
-    values=$(python3 -c 'import json; c=json.load(open("/var/lib/simple-backup/config.json")); print(c.get("admin_username","admin")); print(c.get("listen_port",8088))')
+    values=$(python3 -c 'import json; c=json.load(open("/var/lib/simple-backup/config.json")); print(c.get("admin_username","admin")); print(c.get("listen_port",8088)); print(1 if c.get("tls_enabled",True) else 0)')
     username=$(printf '%s\n' "$values" | sed -n '1p')
     port=$(printf '%s\n' "$values" | sed -n '2p')
+    tls_enabled=$(printf '%s\n' "$values" | sed -n '3p')
+    if [ "$tls_enabled" != 1 ]; then
+        echo "面板入口：由 1Panel HTTPS 反向代理提供"
+        echo "1Panel 代理地址：http://127.0.0.1:$port"
+        echo "管理用户名：$username"
+        return
+    fi
     ip=$(cat "$IP_FILE" 2>/dev/null || detect_ip)
     echo "面板地址：https://$ip:$port"
     echo "管理用户名：$username"
@@ -391,23 +415,40 @@ panel_info() {
 change_panel() {
     require_root
     installed || { echo "尚未安装"; return; }
-    values=$(python3 -c 'import json; c=json.load(open("/var/lib/simple-backup/config.json")); print(c.get("admin_username","admin")); print(c.get("listen_port",8088))')
+    values=$(python3 -c 'import json; c=json.load(open("/var/lib/simple-backup/config.json")); print(c.get("admin_username","admin")); print(c.get("listen_port",8088)); print(1 if c.get("tls_enabled",True) else 0)')
     old_user=$(printf '%s\n' "$values" | sed -n '1p')
     old_port=$(printf '%s\n' "$values" | sed -n '2p')
+    tls_enabled=$(printf '%s\n' "$values" | sed -n '3p')
     username=$(prompt "新管理用户名" "$old_user")
     password=$(secret_prompt "新管理密码")
-    port=$(prompt "新公网面板端口（不能填 80）" "$old_port")
+    port=$(prompt "新面板端口（不能填 80）" "$old_port")
     [ -n "$password" ] || password=$(random_password)
     case "$port" in *[!0-9]*|"") echo "端口必须是数字"; return 1 ;; esac
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] && [ "$port" -ne 80 ] || {
         echo "面板端口必须在 1-65535 之间且不能是 80"; return 1;
     }
-    python3 "$APP" --data-dir "$DATA_DIR" init --username "$username" --password "$password" \
-        --port "$port" --host "0.0.0.0" --cert "$CERT" --key "$KEY"
-    open_firewall "$port"
+    if [ "$tls_enabled" = 1 ]; then
+        python3 "$APP" --data-dir "$DATA_DIR" init --username "$username" --password "$password" \
+            --port "$port" --host "0.0.0.0" --cert "$CERT" --key "$KEY"
+        open_firewall "$port"
+    else
+        python3 "$APP" --data-dir "$DATA_DIR" init --username "$username" --password "$password" \
+            --port "$port" --host "127.0.0.1" --no-tls
+    fi
     service_action restart
     panel_info
     echo "新管理密码：$password"
+}
+
+renew_panel_certificate() {
+    tls_enabled=$(python3 -c 'import json; print(1 if json.load(open("/var/lib/simple-backup/config.json")).get("tls_enabled",True) else 0)')
+    if [ "$tls_enabled" != 1 ]; then
+        echo "当前由 1Panel 管理 HTTPS，请直接在 1Panel 中申请或续期网站证书。"
+        return
+    fi
+    issue_ip_certificate
+    service_action restart
+    echo "IP 证书已更新。"
 }
 
 uninstall_app() {
@@ -455,7 +496,7 @@ menu() {
         echo "6. 修改面板用户名/密码/端口"
         echo "7. 更新程序"
         echo "8. 查看日志"
-        echo "9. 重新申请 IP 证书"
+        echo "9. 重新申请内置 IP 证书"
         echo "10. 卸载"
         echo "0. 退出"
         printf "请选择: " >/dev/tty
@@ -469,7 +510,7 @@ menu() {
             6) change_panel ;;
             7) update_app ;;
             8) show_logs ;;
-            9) issue_ip_certificate; service_action restart; echo "IP 证书已更新。" ;;
+            9) renew_panel_certificate ;;
             10) uninstall_app; return ;;
             0) return ;;
             *) echo "请输入菜单中的数字。" ;;
