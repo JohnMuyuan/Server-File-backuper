@@ -26,6 +26,12 @@ from pathlib import Path
 
 GIB = 1024 ** 3
 MIN_FREE = 3 * GIB
+ERROR_LINE = re.compile(
+    r"(?i)(?:^(?:error|fatal)\b|:\s*(?:error|fatal)\b|"
+    r"\b(?:failed|failure|denied|refused|unreachable|vanished)\b|errors? detected|"
+    r"no such file|not found|timed out|connection (?:reset|closed)|host key|error is not recoverable)"
+)
+VOLATILE_LINE = re.compile(r"(?i)(?:no such file|not found|vanished)")
 DEFAULTS = {
     "tasks": [],
     "telegram_bot_token": "",
@@ -89,6 +95,19 @@ def human_size(size):
         if size < 1024 or unit == "TB":
             return f"{size:.1f} {unit}"
         size /= 1024
+
+
+def command_error(output, code):
+    errors = [line.strip() for line in output.splitlines() if ERROR_LINE.search(line)]
+    if errors:
+        return " | ".join(errors[-6:])[-1600:]
+    return f"命令退出码 {code}；没有返回明确错误，请查看任务完整日志"
+
+
+def source_changed_only(output):
+    errors = [line for line in output.splitlines() if ERROR_LINE.search(line)]
+    details = [line for line in errors if not re.search(r"(?i)\b\d+\s+errors?\b", line)]
+    return bool(details) and all(VOLATILE_LINE.search(line) for line in details)
 
 
 def directory_size(path):
@@ -462,7 +481,7 @@ class BackupApp:
         command = [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", "sh", "-s", "--", task["source_type"]]
         code, output = self.execute(command, task, job, stdin=REMOTE_SETUP)
         if code:
-            raise RuntimeError("远程依赖自动安装失败：" + (output[-500:] or f"退出码 {code}"))
+            raise RuntimeError("远程依赖自动安装失败：" + command_error(output, code))
         state["dependencies_ready"] = True
         self._save_state()
 
@@ -475,13 +494,13 @@ class BackupApp:
         parallel = min(threads, max(1, file_count)) if file_count else threads
         return parallel, max(1, threads // parallel)
 
-    def transfer_command(self, task, staging, file_count=0):
+    def transfer_command(self, task, staging, file_count=0, resume=False):
         destination = str(staging) + "/"
         _, ssh = self.ssh_program(task)
-        if task["transfer_threads"] == 1:
+        if task["transfer_threads"] == 1 or resume:
             return [
-                "rsync", "-a", "--partial", "--append-verify", "--info=progress2",
-                "--protect-args", "--delete", "-e", ssh,
+                "rsync", "-a", "--partial", *(["--checksum"] if resume else []), "--info=progress2",
+                "--protect-args", "--delete-after", "-e", ssh,
                 f"{task['remote_user']}@{task['remote_host']}:{task['remote_path'].rstrip('/')}/",
                 destination,
             ]
@@ -494,7 +513,8 @@ class BackupApp:
             "set net:timeout 20; set net:max-retries 5; set net:reconnect-interval-base 3; "
             "set mirror:parallel-directories true; "
             f"open {self.lftp_quote('sftp://' + task['remote_user'] + '@' + task['remote_host'])}; "
-            f"mirror --verbose --continue --delete --parallel={parallel}{pget} "
+            # ponytail: a full pre-scan bounds live trees; filesystem snapshots are required for atomic consistency.
+            f"mirror --verbose --continue --scan-all-first --delete --delete-first --parallel={parallel}{pget} "
             f"{self.lftp_quote(task['remote_path'])} {self.lftp_quote(destination)}"
         )
         return ["lftp", "-e", script + "; bye"]
@@ -604,10 +624,11 @@ class BackupApp:
         remote = (
             f"if v=$(du -sb -- {path} 2>/dev/null); then set -- $v; size=$1; "
             f"elif v=$(du -sk -- {path} 2>/dev/null); then set -- $v; size=$(($1 * 1024)); "
-            f"else exit 1; fi; count=$(find {path} -type f -print 2>/dev/null | wc -l); "
+            f"else exit 1; fi; count=$(find {path} -type f -print 2>/dev/null | head -n {task['transfer_threads']} | wc -l); "
             "printf '%s %s\\n' \"$size\" \"$count\""
         )
         job["phase"] = "正在统计远端文件"
+        job["remote_scanned"] = False
         code, output = self.execute(
             [*prefix, *self.ssh_options(task), f"{task['remote_user']}@{task['remote_host']}", remote],
             task, job,
@@ -617,7 +638,7 @@ class BackupApp:
             self.log("无法取得远端总大小，将继续下载并显示已传输量", "WARN", task["id"])
             return 0
         size, file_count = map(int, values[-1])
-        job["remote_files"] = file_count
+        job.update(remote_files=file_count, remote_scanned=True)
         return size
 
     def sample_transfer(self, staging, task, job):
@@ -643,7 +664,7 @@ class BackupApp:
         job["transferred_bytes"] = total
         total_bytes = job.get("total_bytes", 0)
         if total_bytes:
-            job["progress"] = min(99, int(total * 100 / total_bytes))
+            job["progress"] = max(job.get("progress", 0), min(99, int(total * 100 / total_bytes)))
 
         previous_files = job.get("_file_samples", {})
         candidates, current_files = [], {}
@@ -695,7 +716,7 @@ class BackupApp:
             process.stdin.close()
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
-        output, last_check, last_sample = [], 0, 0
+        output, errors, last_check, last_sample = [], [], 0, 0
         while process.poll() is None:
             if job["stop"].is_set():
                 try:
@@ -713,7 +734,14 @@ class BackupApp:
                 line = key.fileobj.readline()
                 if not line:
                     continue
+                if command[0] == "lftp":
+                    if "Removing old file " in line:
+                        job["phase"] = "正在清理旧断点"
+                    elif "Transferring file " in line:
+                        job["phase"] = "正在下载"
                 output.append(line)
+                if ERROR_LINE.search(line):
+                    errors.append(line.rstrip() + "\n")
                 if len(output) > 120:
                     del output[:40]
                 self.log(f"{command[0]}: {line.rstrip()}", "PROCESS", task["id"])
@@ -721,13 +749,18 @@ class BackupApp:
         if rest:
             output.append(rest)
             for line in rest.splitlines():
+                if ERROR_LINE.search(line):
+                    errors.append(line.rstrip() + "\n")
                 self.log(f"{command[0]}: {line}", "PROCESS", task["id"])
         if monitor_path is not None:
             self.sample_transfer(monitor_path, task, job)
             if process.returncode == 0:
                 job["progress"] = 100
         job["process"] = None
-        return process.returncode, "".join(output)[-6000:]
+        detail = "".join(output)[-6000:]
+        if errors:
+            detail += "\n" + "".join(errors[-20:])
+        return process.returncode, detail[-12000:]
 
     def backups(self, task):
         root = Path(task["backup_dir"])
@@ -774,17 +807,22 @@ class BackupApp:
         if task["source_type"] == "files":
             staging.mkdir(exist_ok=True)
             os.chmod(staging, 0o700)
+            resume = any(staging.iterdir())
             job["total_bytes"] = self.remote_size(task, job)
-            parallel, segments = self.transfer_layout(task["transfer_threads"], job.get("remote_files", 0))
+            parallel, segments = (1, 1) if resume else self.transfer_layout(
+                task["transfer_threads"], job.get("remote_files", 0)
+            )
             job.update(parallel_files=parallel, segments_per_file=segments)
-            job["phase"] = "正在下载"
+            job["phase"] = "正在校验断点并续传" if resume else (
+                "正在扫描远端清单" if task["transfer_threads"] > 1 else "正在下载"
+            )
             job["progress"] = 0
             job["_sample_time"] = time.time()
             job["_sample_total"] = 0
             self.sample_transfer(staging, task, job)
             job.update(speed_bps=0, slots=[])
             code, output = self.execute(
-                self.transfer_command(task, staging, job.get("remote_files", 0)),
+                self.transfer_command(task, staging, job.get("remote_files", 0), resume),
                 task, job, monitor_path=staging,
             )
         else:
@@ -797,7 +835,10 @@ class BackupApp:
         if job["stop"].is_set():
             raise RuntimeError(job.get("reason") or "备份已停止")
         if code:
-            raise RuntimeError(output[-800:] or f"备份程序退出码 {code}")
+            if task["source_type"] == "files" and job.get("remote_scanned") and source_changed_only(output):
+                self.log("远端文件在扫描后已消失，按实时目录变化跳过并继续生成备份", "WARN", task["id"])
+            else:
+                raise RuntimeError(command_error(output, code))
         job["phase"] = "正在本机压缩"
         job["progress"] = 0
         archive = root / f".archive-{task['id']}.tar.zst"
@@ -809,7 +850,7 @@ class BackupApp:
             raise RuntimeError(job.get("reason") or "压缩已停止")
         if code:
             archive.unlink(missing_ok=True)
-            raise RuntimeError(output[-800:] or f"本机压缩程序退出码 {code}")
+            raise RuntimeError(command_error(output, code))
         self.apply_retention(task)
         final = root / f"{datetime.now():%Y%m%d-%H%M%S}_{backup_prefix(task)}.tar.zst"
         os.replace(archive, final)
@@ -829,7 +870,7 @@ class BackupApp:
                 "reason": "", "next_progress_notice": 25, "phase": "正在下载",
                 "speed_bps": 0, "transferred_bytes": 0, "total_bytes": 0, "slots": [],
                 "remote_files": 0, "parallel_files": 1, "segments_per_file": 1,
-                "discard_partial": False,
+                "remote_scanned": False, "discard_partial": False,
             }
             self.jobs[task_id] = job
         threading.Thread(target=self._backup_worker, args=(dict(task), job, source), daemon=True).start()
@@ -1527,14 +1568,14 @@ class Handler(BaseHTTPRequestHandler):
             ok, message = self.app.start_backup(task_id, source)
             if not ok:
                 raise ValueError(message)
-            self.redirect("/")
+            self.redirect("/tasks")
         elif path in ("/backup/pause", "/backup/stop"):
             ok, message = self.app.stop_backup(
                 form.get("id", ""), path == "/backup/stop", "网页"
             )
             if not ok:
                 raise ValueError(message)
-            self.redirect("/")
+            self.redirect("/tasks")
         elif path == "/backup/delete":
             task = self.app.task(form.get("id", ""))
             allowed = {p.name: p for p in self.app.backups(task)} if task else {}

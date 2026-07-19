@@ -9,7 +9,8 @@ from pathlib import Path
 
 from backup_manager import (
     BackupApp, TASK_DEFAULTS, backup_prefix, human_size, initialize,
-    migrate_config, password_fields, validate_task, verify_password,
+    command_error, migrate_config, password_fields, source_changed_only,
+    validate_task, verify_password,
 )
 
 
@@ -52,13 +53,21 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("--parallel=4", lftp[2])
             self.assertNotIn("--use-pget-n", lftp[2])
             self.assertIn("mirror:parallel-directories true", lftp[2])
+            self.assertIn("--scan-all-first", lftp[2])
+            self.assertIn("--delete-first", lftp[2])
+            self.assertNotIn("--loop", lftp[2])
             large = app.transfer_command(task, root / "partial", 1)
             self.assertIn("--parallel=1 --use-pget-n=4", large[2])
             mixed = app.transfer_command(task, root / "partial", 2)
             self.assertIn("--parallel=2 --use-pget-n=2", mixed[2])
             rsync = app.transfer_command({**task, "transfer_threads": 1}, root / "partial")
             self.assertEqual(rsync[0], "rsync")
-            self.assertIn("--append-verify", rsync)
+            self.assertIn("--partial", rsync)
+            self.assertIn("--delete-after", rsync)
+            self.assertNotIn("--append-verify", rsync)
+            resume = app.transfer_command(task, root / "partial", 100, True)
+            self.assertEqual(resume[0], "rsync")
+            self.assertIn("--checksum", resume)
             password_task = {**task, "auth_method": "password"}
             app.set_task_password(task["id"], "remote secret")
             self.assertIn("sshpass -e ssh", app.transfer_command(password_task, root / "partial")[2])
@@ -205,6 +214,17 @@ class BackupManagerTest(unittest.TestCase):
             os.utime(tiny, (1, 1))
             app.sample_transfer(staging, progress_task, job)
             self.assertIn("new-tiny.txt", [slot["name"] for slot in job["slots"]])
+
+            job.update(progress=80, _sample_time=time.time() - 1, _sample_total=516)
+            tiny.unlink()
+            app.sample_transfer(staging, progress_task, job)
+            self.assertEqual(job["progress"], 80)
+
+            vanished = "mirror: Access failed: No such file (/live/temporary.log)\nmirror: 1 error detected\n"
+            self.assertTrue(source_changed_only(vanished))
+            self.assertFalse(source_changed_only(vanished + "mirror: Permission denied (/private)\n"))
+            self.assertIn("No such file", command_error(vanished + "Transferring file normal\n", 1))
+            self.assertNotIn("error.log", command_error("Transferring file `log/error.log'\n", 1))
 
             app.config["tasks"].append(progress_task)
             app.log("只属于这个任务", task_id=progress_task["id"])
