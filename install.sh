@@ -128,6 +128,23 @@ ensure_cron() {
     fi
 }
 
+verify_webroot_route() {
+    probe_root=$1
+    probe_ip=$2
+    probe_token="simple-backup-$(openssl rand -hex 8)"
+    probe_dir="$probe_root/.well-known/acme-challenge"
+    probe_file="$probe_dir/$probe_token"
+    mkdir -p "$probe_dir"
+    printf '%s' "$probe_token" >"$probe_file"
+    probe_body=$(curl -4 -fsS --max-time 10 "http://$probe_ip/.well-known/acme-challenge/$probe_token" 2>/dev/null || true)
+    rm -f "$probe_file"
+    [ "$probe_body" = "$probe_token" ] || {
+        echo "网站根目录校验失败：公网访问验证文件时没有得到正确内容。"
+        echo "请在 1Panel 中把对应网站设为默认站点（或绑定 IP $probe_ip），并填写该网站显示的实际根目录，而不是 sites 上级目录。"
+        return 1
+    }
+}
+
 issue_ip_certificate() {
     ip=${1:-${SB_PUBLIC_IP:-}}
     webroot=${SB_ACME_WEBROOT:-}
@@ -170,6 +187,7 @@ issue_ip_certificate() {
         echo "TCP 80 和 443 均被占用，也未检测到 Nginx/Apache。请设置 SB_ACME_WEBROOT 为现有网站根目录后重试。"
         exit 1
     fi
+    [ "$challenge" != webroot ] || verify_webroot_route "$webroot" "$ip" || exit 1
     if [ ! -x "$ACME" ]; then
         curl -fsSL https://get.acme.sh | sh
     fi
