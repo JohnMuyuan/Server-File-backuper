@@ -1487,6 +1487,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
+        self.send_header("Connection", "close")
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -1502,14 +1503,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Strict-Transport-Security", "max-age=31536000")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
     def redirect(self, location, cookie=None):
         self.send_response(303)
         self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         if cookie:
             self.send_header("Set-Cookie", cookie)
+        self.close_connection = True
         self.end_headers()
 
     def form(self):

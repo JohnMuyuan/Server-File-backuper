@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from backup_manager import (
-    BackupApp, TASK_DEFAULTS, backup_prefix, human_size, initialize,
+    BackupApp, Handler, TASK_DEFAULTS, backup_prefix, human_size, initialize,
     command_error, migrate_config, password_fields, source_changed_only,
     validate_task, verify_password,
 )
@@ -294,6 +294,24 @@ class BackupManagerTest(unittest.TestCase):
             app.clear_partial(task)
             self.assertFalse(partial.exists())
             self.assertTrue(history.exists())
+
+    def test_redirect_is_framed_and_closed(self):
+        class Response:
+            def __init__(self):
+                self.headers = []
+            def send_response(self, status):
+                self.status = status
+            def send_header(self, name, value):
+                self.headers.append((name, value))
+            def end_headers(self):
+                pass
+
+        response = Response()
+        Handler.redirect(response, "/tasks")
+        self.assertEqual(response.status, 303)
+        self.assertIn(("Content-Length", "0"), response.headers)
+        self.assertIn(("Connection", "close"), response.headers)
+        self.assertTrue(response.close_connection)
 
     def test_installer_does_not_overwrite_panel_port(self):
         script = Path("install.sh").read_text(encoding="utf-8")
