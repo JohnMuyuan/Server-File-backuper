@@ -1073,7 +1073,8 @@ pre{{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1
 <a href="/task">新建任务</a><a href="/logs">日志</a><a href="/settings">设置</a><button type="button" class="theme-icon" id="theme" aria-label="切换主题" title="切换主题">◐</button><a href="/logout">退出</a></nav></header>
 <main>{body}</main><script>document.querySelectorAll('form').forEach(f=>{{
 if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value='{csrf}';f.appendChild(i)}}}});
-document.querySelectorAll('pre.tail-log').forEach(p=>p.scrollTop=p.scrollHeight);
+const tailLogs=()=>document.querySelectorAll('pre.tail-log').forEach(p=>p.scrollTop=p.scrollHeight);
+addEventListener('pageshow',()=>requestAnimationFrame(tailLogs));
 const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}},ti={{auto:'◐',light:'☀',dark:'☾'}};
 function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent=ti[t];tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title);if(feedback){{tb.classList.remove('changed');void tb.offsetWidth;tb.classList.add('changed');setTimeout(()=>tb.classList.remove('changed'),220)}}}}
 tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);

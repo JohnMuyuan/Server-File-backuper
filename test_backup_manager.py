@@ -188,6 +188,7 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("queue-item", app.home_html(app.sign_session("panel-user")))
             self.assertIn("tail-log", app.home_html(app.sign_session("panel-user")))
             self.assertIn("scrollHeight", app.logs_html(app.sign_session("panel-user")))
+            self.assertIn("pageshow", app.logs_html(app.sign_session("panel-user")))
             self.assertIn("@media(max-width:640px)", app.home_html(app.sign_session("panel-user")))
             self.assertIn('/telegram/test', app.settings_html(app.sign_session("panel-user")))
             self.assertIn('source-type', app.task_form_html(database_task, app.sign_session("panel-user")))
