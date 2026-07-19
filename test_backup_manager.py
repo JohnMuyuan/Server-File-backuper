@@ -9,7 +9,7 @@ from pathlib import Path
 
 from backup_manager import (
     BackupApp, Handler, TASK_DEFAULTS, backup_prefix, human_size, initialize,
-    command_error, incremental_ledger, incremental_path, migrate_config, password_fields, source_changed_only,
+    command_error, incremental_ledger, incremental_path, migrate_config, mirror_path, password_fields, source_changed_only,
     serve, validate_task, verify_password,
 )
 
@@ -64,6 +64,10 @@ class BackupManagerTest(unittest.TestCase):
             incremental_command = app.transfer_command(incremental_task, root / "incremental", chunk)
             self.assertIn("--ignore-existing", incremental_command)
             self.assertNotIn("--delete-after", incremental_command)
+            mirror_task = sample_task(root / "mirror-command", id="e1b2c3d4", file_mode="mirror")
+            mirror_path(mirror_task).mkdir(parents=True)
+            mirror_command = app.transfer_command(mirror_task, root / "mirror-staging", chunk)
+            self.assertIn(f"--link-dest={mirror_path(mirror_task)}", mirror_command)
             parallel_staging = root / "parallel-staging"
             parallel_staging.mkdir()
             chunks = []
@@ -140,6 +144,27 @@ class BackupManagerTest(unittest.TestCase):
             old_snapshot.write_bytes(b"old")
             app.apply_retention({**incremental_task, "file_mode": "snapshot", "retention_limit": 1})
             self.assertTrue(final.exists())
+            self.assertFalse(old_snapshot.exists())
+
+            mirror_task = sample_task(
+                root / "mirror-backup", id="f1b2c3d4", file_mode="mirror",
+            )
+            current = mirror_path(mirror_task)
+            current.mkdir(parents=True)
+            (current / "deleted-remotely.txt").write_text("old", encoding="utf-8")
+            final, size, _ = app.backup_once(
+                mirror_task,
+                {"stop": threading.Event(), "phase": "", "progress": 0},
+            )
+            self.assertEqual(final, current)
+            self.assertEqual(size, 4)
+            self.assertTrue((current / "downloaded.txt").exists())
+            self.assertFalse((current / "deleted-remotely.txt").exists())
+            self.assertFalse((Path(mirror_task["backup_dir"]) / f".partial-{mirror_task['id']}").exists())
+            old_snapshot = Path(mirror_task["backup_dir"]) / f"20260101-010101_{backup_prefix(mirror_task)}.tar.zst"
+            old_snapshot.write_bytes(b"old")
+            app.apply_retention({**mirror_task, "file_mode": "snapshot", "retention_limit": 1})
+            self.assertTrue(current.exists())
             self.assertFalse(old_snapshot.exists())
 
             database_backup = sample_task(

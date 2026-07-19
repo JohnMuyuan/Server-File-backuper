@@ -147,6 +147,10 @@ def incremental_ledger(task):
     return Path(task["backup_dir"]) / f".incremental-{task['id']}.files"
 
 
+def mirror_path(task):
+    return Path(task["backup_dir"]) / f"mirror_{backup_prefix(task)}"
+
+
 def validate_task(raw, existing_id=""):
     task = dict(TASK_DEFAULTS)
     task.update(raw)
@@ -188,7 +192,7 @@ def validate_task(raw, existing_id=""):
         raise ValueError("SSH 用户名格式无效")
     if task["source_type"] not in ("files", "mysql", "postgresql", "redis"):
         raise ValueError("备份类型无效")
-    if task["file_mode"] not in ("snapshot", "incremental"):
+    if task["file_mode"] not in ("snapshot", "incremental", "mirror"):
         raise ValueError("文件保存方式无效")
     if task["source_type"] != "files":
         task["file_mode"] = "snapshot"
@@ -510,6 +514,8 @@ class BackupApp:
         ]
         if task.get("file_mode") == "incremental":
             command.append("--ignore-existing")
+        elif task.get("file_mode") == "mirror" and mirror_path(task).is_dir():
+            command.append(f"--link-dest={mirror_path(task)}")
         if files_from is not None:
             command += ["--from0", f"--files-from={files_from}", "--relative"]
         else:
@@ -952,7 +958,7 @@ class BackupApp:
         limit = task["retention_limit"]
         if not limit:
             return
-        items = [item for item in self.backups(task) if item != incremental_path(task)]
+        items = [item for item in self.backups(task) if item not in (incremental_path(task), mirror_path(task))]
         while len(items) >= limit:
             oldest = items.pop(0)
             self.delete_backup(oldest)
@@ -975,6 +981,10 @@ class BackupApp:
         root = Path(task["backup_dir"])
         root.mkdir(parents=True, exist_ok=True)
         incremental = task["source_type"] == "files" and task.get("file_mode") == "incremental"
+        mirror = task["source_type"] == "files" and task.get("file_mode") == "mirror"
+        old_mirror = root / f".mirror-old-{task['id']}"
+        if mirror and not mirror_path(task).exists() and old_mirror.exists():
+            os.replace(old_mirror, mirror_path(task))
         staging = incremental_path(task) if incremental else root / f".partial-{task['id']}"
         if task["source_type"] == "files":
             staging.mkdir(exist_ok=True)
@@ -1011,6 +1021,20 @@ class BackupApp:
             incremental_ledger(task).unlink(missing_ok=True)
             os.utime(staging)
             return staging, directory_size(staging), self.free_space(task)
+        if mirror:
+            job.update(phase="正在替换完整镜像", progress=100)
+            shutil.rmtree(old_mirror, ignore_errors=True)
+            current = mirror_path(task)
+            if current.exists():
+                os.replace(current, old_mirror)
+            try:
+                os.replace(staging, current)
+            except Exception:
+                if old_mirror.exists() and not current.exists():
+                    os.replace(old_mirror, current)
+                raise
+            shutil.rmtree(old_mirror, ignore_errors=True)
+            return current, directory_size(current), self.free_space(task)
         job["phase"] = "正在本机压缩"
         job["progress"] = 0
         archive = root / f".archive-{task['id']}.tar.zst"
@@ -1253,7 +1277,7 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
 const am=document.getElementById('auth-method'),ka=document.getElementById('key-auth'),pa=document.getElementById('password-auth');
 function authUI(){{if(!am)return;ka.hidden=am.value!=='key';pa.hidden=am.value!=='password'}}if(am){{am.onchange=authUI;authUI()}}
 const so=document.getElementById('source-type'),fm=document.getElementById('file-mode'),fs=document.getElementById('file-source'),ds=document.getElementById('database-source'),ft=document.getElementById('file-threads'),rs=document.getElementById('retention-settings'),rp=document.getElementById('remote-path'),du=document.getElementById('database-user'),dn=document.getElementById('database-name');
-function sourceUI(){{if(!so)return;let files=so.value==='files',sql=so.value==='mysql'||so.value==='postgresql',incremental=files&&fm.value==='incremental';fs.hidden=!files;ds.hidden=files;ft.hidden=!files;rs.hidden=incremental;rp.required=files;du.required=sql;dn.required=sql}}if(so){{so.onchange=sourceUI;fm.onchange=sourceUI;sourceUI()}}
+function sourceUI(){{if(!so)return;let files=so.value==='files',sql=so.value==='mysql'||so.value==='postgresql',persistent=files&&fm.value!=='snapshot';fs.hidden=!files;ds.hidden=files;ft.hidden=!files;rs.hidden=persistent;rp.required=files;du.required=sql;dn.required=sql}}if(so){{so.onchange=sourceUI;fm.onchange=sourceUI;sourceUI()}}
 const st=document.getElementById('schedule-times'),sv=document.getElementById('schedule-times-value'),add=document.getElementById('add-time');
 if(st){{add.onclick=()=>{{if(st.querySelectorAll('.schedule-time').length>=24)return;st.insertAdjacentHTML('beforeend','<div class="time-row"><input class="schedule-time" type="time" value="12:00" required><button type="button" class="remove-time secondary" title="删除时间">×</button></div>')}};
 st.onclick=e=>{{if(e.target.classList.contains('remove-time')&&st.querySelectorAll('.schedule-time').length>1)e.target.parentElement.remove()}};
@@ -1357,7 +1381,7 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
                 label = "继续备份" if partial.exists() or state.get("last_result") == "已暂停" else "立即备份"
                 action = f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task['id']}'><button>{label}</button></form>"
             if task["source_type"] == "files":
-                mode = "（增量归档，只新增）" if task.get("file_mode") == "incremental" else ""
+                mode = {"incremental": "（增量归档，只新增）", "mirror": "（完全镜像同步）"}.get(task.get("file_mode"), "")
                 source = self.esc(task["remote_path"] + mode)
             else:
                 port = task["database_port"] or {"mysql": 3306, "postgresql": 5432, "redis": 6379}[task["source_type"]]
@@ -1432,8 +1456,8 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
  </div><div id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password">
 <small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div></div>
 <div><div id="file-source"><label>远程文件或目录</label><input id="remote-path" name="remote_path" required value="{self.esc(task['remote_path'])}">
-<label>文件保存方式</label><select id="file-mode" name="file_mode"><option value="snapshot" {file_mode_selected('snapshot')}>快照压缩包</option><option value="incremental" {file_mode_selected('incremental')}>增量归档（只新增、不压缩）</option></select>
-<small class="muted">增量归档会跳过本地已有路径，只下载新增文件；源端删除文件时，本地仍保留。</small></div>
+<label>文件保存方式</label><select id="file-mode" name="file_mode"><option value="snapshot" {file_mode_selected('snapshot')}>快照压缩包</option><option value="incremental" {file_mode_selected('incremental')}>增量归档（只新增、不压缩）</option><option value="mirror" {file_mode_selected('mirror')}>完全镜像同步（不压缩）</option></select>
+<small class="muted">增量归档只添加新文件；完全镜像会同步新增、修改和删除。两种模式都使用一个固定目录。</small></div>
 <div id="database-source"><label>数据库地址</label><input name="database_host" value="{self.esc(task['database_host'])}"><small class="muted">这是相对于远程服务器的地址，数据库在同一台机器通常填 127.0.0.1。</small>
 <label>数据库端口</label><input name="database_port" type="number" min="0" max="65535" value="{task['database_port']}"><small class="muted">填 0 自动使用 MySQL 3306、PostgreSQL 5432 或 Redis 6379。</small>
 <label>数据库用户名</label><input id="database-user" name="database_user" maxlength="128" value="{self.esc(task['database_user'])}">
