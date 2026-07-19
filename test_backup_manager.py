@@ -9,7 +9,7 @@ from pathlib import Path
 
 from backup_manager import (
     BackupApp, Handler, TASK_DEFAULTS, backup_prefix, human_size, initialize,
-    command_error, migrate_config, password_fields, source_changed_only,
+    command_error, incremental_ledger, incremental_path, migrate_config, password_fields, source_changed_only,
     serve, validate_task, verify_password,
 )
 
@@ -60,6 +60,10 @@ class BackupManagerTest(unittest.TestCase):
             self.assertNotIn("--delete-after", rsync)
             fallback = app.transfer_command(task, root / "partial")
             self.assertIn("--delete-after", fallback)
+            incremental_task = {**task, "file_mode": "incremental"}
+            incremental_command = app.transfer_command(incremental_task, root / "incremental", chunk)
+            self.assertIn("--ignore-existing", incremental_command)
+            self.assertNotIn("--delete-after", incremental_command)
             parallel_staging = root / "parallel-staging"
             parallel_staging.mkdir()
             chunks = []
@@ -110,6 +114,34 @@ class BackupManagerTest(unittest.TestCase):
             self.assertEqual(size, 4)
             self.assertFalse((Path(compressed_task["backup_dir"]) / f".partial-{compressed_task['id']}").exists())
 
+            incremental_task = sample_task(
+                root / "incremental-backup", id="d1b2c3d4", file_mode="incremental",
+            )
+            final, size, _ = app.backup_once(
+                incremental_task,
+                {"stop": threading.Event(), "phase": "", "progress": 0},
+            )
+            self.assertEqual(final, incremental_path(incremental_task))
+            self.assertTrue(final.is_dir())
+            self.assertEqual(size, 4)
+            self.assertFalse(incremental_ledger(incremental_task).exists())
+            kept = final / "kept.txt"
+            new = final / "new.txt"
+            partial = final / ".rsync-partial"
+            kept.write_text("old", encoding="utf-8")
+            new.write_text("new", encoding="utf-8")
+            partial.mkdir()
+            incremental_ledger(incremental_task).write_bytes(b"./new.txt\0")
+            app.clear_partial(incremental_task)
+            self.assertTrue(kept.exists())
+            self.assertFalse(new.exists())
+            self.assertFalse(partial.exists())
+            old_snapshot = Path(incremental_task["backup_dir"]) / f"20260101-010101_{backup_prefix(incremental_task)}.tar.zst"
+            old_snapshot.write_bytes(b"old")
+            app.apply_retention({**incremental_task, "file_mode": "snapshot", "retention_limit": 1})
+            self.assertTrue(final.exists())
+            self.assertFalse(old_snapshot.exists())
+
             database_backup = sample_task(
                 root / "database-compressed", id="c1b2c3d4", source_type="postgresql",
                 database_user="backup", database_name="app",
@@ -129,6 +161,7 @@ class BackupManagerTest(unittest.TestCase):
             for change in (
                 {"remote_host": "bad host;rm"}, {"backup_dir": "/"},
                 {"transfer_threads": 16999}, {"remote_path": "relative"},
+                {"file_mode": "replace-existing"},
             ):
                 with self.assertRaises(ValueError):
                     sample_task(root / "backup", **change)

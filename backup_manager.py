@@ -23,7 +23,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 GIB = 1024 ** 3
 MIN_FREE = 3 * GIB
@@ -49,7 +49,8 @@ DEFAULTS = {
 TASK_DEFAULTS = {
     "id": "", "name": "新备份任务", "remote_host": "", "remote_port": 22,
     "remote_user": "root", "remote_path": "/", "ssh_key": "/root/.ssh/id_ed25519",
-    "source_type": "files", "database_host": "127.0.0.1", "database_port": 0,
+    "source_type": "files", "file_mode": "snapshot",
+    "database_host": "127.0.0.1", "database_port": 0,
     "database_user": "", "database_name": "",
     "backup_dir": "/var/backups/simple-backup", "interval_days": 3,
     "schedule_times": ["02:00"],
@@ -138,13 +139,21 @@ def backup_prefix(task):
     return f"{task['id']}_{safe_name(task['remote_host'])}"
 
 
+def incremental_path(task):
+    return Path(task["backup_dir"]) / f"incremental_{backup_prefix(task)}"
+
+
+def incremental_ledger(task):
+    return Path(task["backup_dir"]) / f".incremental-{task['id']}.files"
+
+
 def validate_task(raw, existing_id=""):
     task = dict(TASK_DEFAULTS)
     task.update(raw)
     task["id"] = str(existing_id or task.get("id") or secrets.token_hex(4)).lower()
     for key in (
         "name", "remote_host", "remote_user", "remote_path", "ssh_key", "backup_dir",
-        "source_type", "database_host", "database_user", "database_name",
+        "source_type", "file_mode", "database_host", "database_user", "database_name",
     ):
         task[key] = str(task.get(key, "")).strip()
     try:
@@ -179,6 +188,10 @@ def validate_task(raw, existing_id=""):
         raise ValueError("SSH 用户名格式无效")
     if task["source_type"] not in ("files", "mysql", "postgresql", "redis"):
         raise ValueError("备份类型无效")
+    if task["file_mode"] not in ("snapshot", "incremental"):
+        raise ValueError("文件保存方式无效")
+    if task["source_type"] != "files":
+        task["file_mode"] = "snapshot"
     if task["source_type"] == "files" and (not task["remote_path"].startswith("/") or any(ord(c) < 32 for c in task["remote_path"])):
         raise ValueError("远程路径必须是绝对路径")
     if not re.fullmatch(r"[A-Za-z0-9._:-]+", task["database_host"]):
@@ -495,6 +508,8 @@ class BackupApp:
             "rsync", "-a", "--numeric-ids", "--partial", "--partial-dir=.rsync-partial",
             "--info=progress2", "--protect-args",
         ]
+        if task.get("file_mode") == "incremental":
+            command.append("--ignore-existing")
         if files_from is not None:
             command += ["--from0", f"--files-from={files_from}", "--relative"]
         else:
@@ -505,7 +520,7 @@ class BackupApp:
             destination,
         ]
 
-    def scan_remote_manifest(self, task, state_dir, job):
+    def scan_remote_manifest(self, task, state_dir, job, existing_root=None, ledger=None):
         state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         for old in state_dir.glob("files.chunk.*"):
             old.unlink(missing_ok=True)
@@ -529,6 +544,10 @@ class BackupApp:
         process = None
         buffer = b""
         count = 0
+        existing_root = os.fsencode(existing_root) if existing_root else None
+        ledger_writer = ledger.open("ab") if ledger else None
+        if ledger:
+            os.chmod(ledger, 0o600)
 
         def consume(data):
             nonlocal buffer, count
@@ -538,7 +557,12 @@ class BackupApp:
             for entry in entries:
                 if not entry:
                     continue
+                relative = entry[2:] if entry.startswith(b"./") else entry
+                if existing_root and os.path.lexists(os.path.join(existing_root, relative.replace(b"/", os.sep.encode()))):
+                    continue
                 writers[count % len(writers)].write(entry + b"\0")
+                if ledger_writer:
+                    ledger_writer.write(entry + b"\0")
                 count += 1
 
         job.update(phase="正在扫描并固定本轮远端文件清单", remote_scanned=False)
@@ -579,6 +603,8 @@ class BackupApp:
         finally:
             for writer in writers:
                 writer.close()
+            if ledger_writer:
+                ledger_writer.close()
             job["process"] = None
             error_path.unlink(missing_ok=True)
 
@@ -613,9 +639,15 @@ class BackupApp:
         shutil.rmtree(Path(staging) / ".rsync-partial", ignore_errors=True)
 
     def transfer_manifest(self, task, staging, state_dir, job):
-        chunks = self.scan_remote_manifest(task, state_dir, job)
+        incremental = task.get("file_mode") == "incremental"
+        chunks = self.scan_remote_manifest(
+            task, state_dir, job,
+            staging if incremental else None,
+            incremental_ledger(task) if incremental else None,
+        )
         if not chunks:
-            self.clean_staging_from_manifest(staging, chunks)
+            if not incremental:
+                self.clean_staging_from_manifest(staging, chunks)
             job.update(progress=100, parallel_files=0, segments_per_file=1)
             return
         job.update(
@@ -636,7 +668,10 @@ class BackupApp:
             raise RuntimeError(command_error(failures[0][1], failures[0][0]))
         if vanished:
             self.log("扫描后有实时文件已消失，本轮已跳过；不会追踪扫描后新增的文件", "WARN", task["id"])
-        self.clean_staging_from_manifest(staging, chunks)
+        if incremental:
+            shutil.rmtree(Path(staging) / ".rsync-partial", ignore_errors=True)
+        else:
+            self.clean_staging_from_manifest(staging, chunks)
         job["progress"] = 100
 
     def database_command(self, task):
@@ -721,6 +756,25 @@ class BackupApp:
     @staticmethod
     def clear_partial(task):
         root = Path(task["backup_dir"])
+        if task.get("file_mode") == "incremental":
+            target, ledger = incremental_path(task), incremental_ledger(task)
+            try:
+                entries = ledger.read_bytes().split(b"\0")
+            except FileNotFoundError:
+                entries = []
+            for entry in reversed(entries):
+                relative = entry[2:] if entry.startswith(b"./") else entry
+                relative_path = PurePosixPath(os.fsdecode(relative))
+                parts = relative_path.parts
+                if not relative or relative_path.is_absolute() or ".." in parts:
+                    continue
+                path = target.joinpath(*parts)
+                try:
+                    path.unlink() if path.is_file() or path.is_symlink() else path.rmdir()
+                except (FileNotFoundError, OSError):
+                    pass
+            ledger.unlink(missing_ok=True)
+            shutil.rmtree(target / ".rsync-partial", ignore_errors=True)
         shutil.rmtree(root / f".partial-{task['id']}", ignore_errors=True)
         shutil.rmtree(root / f".transfer-{task['id']}", ignore_errors=True)
         (root / f".archive-{task['id']}.tar.zst").unlink(missing_ok=True)
@@ -782,10 +836,11 @@ class BackupApp:
         elapsed = max(0.001, now - previous_time)
         previous_total = job.get("_sample_total", total)
         job["speed_bps"] = max(0, total - previous_total) / elapsed
-        job["transferred_bytes"] = total
+        transferred = max(0, total - job.get("_transfer_base", 0))
+        job["transferred_bytes"] = transferred
         total_bytes = job.get("total_bytes", 0)
         if total_bytes:
-            job["progress"] = max(job.get("progress", 0), min(99, int(total * 100 / total_bytes)))
+            job["progress"] = max(job.get("progress", 0), min(99, int(transferred * 100 / total_bytes)))
 
         previous_files = job.get("_file_samples", {})
         candidates, current_files = [], {}
@@ -897,7 +952,7 @@ class BackupApp:
         limit = task["retention_limit"]
         if not limit:
             return
-        items = self.backups(task)
+        items = [item for item in self.backups(task) if item != incremental_path(task)]
         while len(items) >= limit:
             oldest = items.pop(0)
             self.delete_backup(oldest)
@@ -919,17 +974,19 @@ class BackupApp:
         self.remote_setup(task, job)
         root = Path(task["backup_dir"])
         root.mkdir(parents=True, exist_ok=True)
-        staging = root / f".partial-{task['id']}"
+        incremental = task["source_type"] == "files" and task.get("file_mode") == "incremental"
+        staging = incremental_path(task) if incremental else root / f".partial-{task['id']}"
         if task["source_type"] == "files":
             staging.mkdir(exist_ok=True)
             os.chmod(staging, 0o700)
-            resume = any(staging.iterdir())
-            job["total_bytes"] = self.remote_size(task, job)
+            resume = (staging / ".rsync-partial").exists() if incremental else any(staging.iterdir())
+            job["total_bytes"] = 0 if incremental else self.remote_size(task, job)
             job.update(parallel_files=task["transfer_threads"], segments_per_file=1)
             job["phase"] = "正在重新扫描并校验断点" if resume else "正在扫描远端清单"
             job["progress"] = 0
             job["_sample_time"] = time.time()
-            job["_sample_total"] = 0
+            job["_transfer_base"] = directory_size(staging) if incremental else 0
+            job["_sample_total"] = job["_transfer_base"]
             self.sample_transfer(staging, task, job)
             job.update(speed_bps=0, slots=[])
             state_dir = root / f".transfer-{task['id']}"
@@ -949,6 +1006,11 @@ class BackupApp:
             raise RuntimeError(job.get("reason") or "备份已停止")
         if code:
             raise RuntimeError(command_error(output, code))
+        if incremental:
+            job.update(phase="增量归档完成", progress=100)
+            incremental_ledger(task).unlink(missing_ok=True)
+            os.utime(staging)
+            return staging, directory_size(staging), self.free_space(task)
         job["phase"] = "正在本机压缩"
         job["progress"] = 0
         archive = root / f".archive-{task['id']}.tar.zst"
@@ -1190,8 +1252,8 @@ function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localSto
 tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);
 const am=document.getElementById('auth-method'),ka=document.getElementById('key-auth'),pa=document.getElementById('password-auth');
 function authUI(){{if(!am)return;ka.hidden=am.value!=='key';pa.hidden=am.value!=='password'}}if(am){{am.onchange=authUI;authUI()}}
-const so=document.getElementById('source-type'),fs=document.getElementById('file-source'),ds=document.getElementById('database-source'),ft=document.getElementById('file-threads'),rp=document.getElementById('remote-path'),du=document.getElementById('database-user'),dn=document.getElementById('database-name');
-function sourceUI(){{if(!so)return;let files=so.value==='files',sql=so.value==='mysql'||so.value==='postgresql';fs.hidden=!files;ds.hidden=files;ft.hidden=!files;rp.required=files;du.required=sql;dn.required=sql}}if(so){{so.onchange=sourceUI;sourceUI()}}
+const so=document.getElementById('source-type'),fm=document.getElementById('file-mode'),fs=document.getElementById('file-source'),ds=document.getElementById('database-source'),ft=document.getElementById('file-threads'),rs=document.getElementById('retention-settings'),rp=document.getElementById('remote-path'),du=document.getElementById('database-user'),dn=document.getElementById('database-name');
+function sourceUI(){{if(!so)return;let files=so.value==='files',sql=so.value==='mysql'||so.value==='postgresql',incremental=files&&fm.value==='incremental';fs.hidden=!files;ds.hidden=files;ft.hidden=!files;rs.hidden=incremental;rp.required=files;du.required=sql;dn.required=sql}}if(so){{so.onchange=sourceUI;fm.onchange=sourceUI;sourceUI()}}
 const st=document.getElementById('schedule-times'),sv=document.getElementById('schedule-times-value'),add=document.getElementById('add-time');
 if(st){{add.onclick=()=>{{if(st.querySelectorAll('.schedule-time').length>=24)return;st.insertAdjacentHTML('beforeend','<div class="time-row"><input class="schedule-time" type="time" value="12:00" required><button type="button" class="remove-time secondary" title="删除时间">×</button></div>')}};
 st.onclick=e=>{{if(e.target.classList.contains('remove-time')&&st.querySelectorAll('.schedule-time').length>1)e.target.parentElement.remove()}};
@@ -1285,7 +1347,7 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
             )
             next_run = datetime.fromtimestamp(state["next_run"]).strftime("%Y-%m-%d %H:%M") if state.get("next_run") else "待安排"
             error = f"<p class='bad'>原因：{self.esc(state.get('last_error'))}</p>" if state.get("last_error") else ""
-            partial = Path(task["backup_dir"]) / f".partial-{task['id']}"
+            partial = incremental_ledger(task) if task.get("file_mode") == "incremental" else Path(task["backup_dir"]) / f".partial-{task['id']}"
             if job:
                 action = (
                     f"<form class='inline' method='post' action='/backup/pause'><input type='hidden' name='id' value='{task['id']}'><button class='secondary'>临时暂停</button></form>"
@@ -1295,7 +1357,8 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
                 label = "继续备份" if partial.exists() or state.get("last_result") == "已暂停" else "立即备份"
                 action = f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task['id']}'><button>{label}</button></form>"
             if task["source_type"] == "files":
-                source = self.esc(task["remote_path"])
+                mode = "（增量归档，只新增）" if task.get("file_mode") == "incremental" else ""
+                source = self.esc(task["remote_path"] + mode)
             else:
                 port = task["database_port"] or {"mysql": 3306, "postgresql": 5432, "redis": 6379}[task["source_type"]]
                 source = self.esc(f"{task['source_type']}://{task['database_host']}:{port}/{task['database_name'] or '整个实例'}")
@@ -1337,6 +1400,7 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
         checked = lambda key: "checked" if task.get(key) else ""
         selected = lambda value: "selected" if task.get("auth_method") == value else ""
         source_selected = lambda value: "selected" if task.get("source_type") == value else ""
+        file_mode_selected = lambda value: "selected" if task.get("file_mode") == value else ""
         time_inputs = "".join(
             f'<div class="time-row"><input class="schedule-time" type="time" value="{self.esc(value)}" required>'
             '<button type="button" class="remove-time secondary" title="删除时间">×</button></div>'
@@ -1367,7 +1431,9 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
 <small class="muted">使用私钥时填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small>
  </div><div id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password">
 <small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div></div>
-<div><div id="file-source"><label>远程文件或目录</label><input id="remote-path" name="remote_path" required value="{self.esc(task['remote_path'])}"></div>
+<div><div id="file-source"><label>远程文件或目录</label><input id="remote-path" name="remote_path" required value="{self.esc(task['remote_path'])}">
+<label>文件保存方式</label><select id="file-mode" name="file_mode"><option value="snapshot" {file_mode_selected('snapshot')}>快照压缩包</option><option value="incremental" {file_mode_selected('incremental')}>增量归档（只新增、不压缩）</option></select>
+<small class="muted">增量归档会跳过本地已有路径，只下载新增文件；源端删除文件时，本地仍保留。</small></div>
 <div id="database-source"><label>数据库地址</label><input name="database_host" value="{self.esc(task['database_host'])}"><small class="muted">这是相对于远程服务器的地址，数据库在同一台机器通常填 127.0.0.1。</small>
 <label>数据库端口</label><input name="database_port" type="number" min="0" max="65535" value="{task['database_port']}"><small class="muted">填 0 自动使用 MySQL 3306、PostgreSQL 5432 或 Redis 6379。</small>
 <label>数据库用户名</label><input id="database-user" name="database_user" maxlength="128" value="{self.esc(task['database_user'])}">
@@ -1379,8 +1445,8 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
 <button type="button" class="secondary" id="add-time">＋ 添加时间</button>
 <input type="hidden" id="schedule-times-value" name="schedule_times">
 <small class="muted">例如每隔 1 天，设置 02:00 和 14:00，就是每天备份两次。</small>
-<label>最多保留多少份</label><input name="retention_limit" type="number" min="0" required value="{task['retention_limit']}">
-<small class="muted">填 0 表示全部保留，不自动删除。</small>
+<div id="retention-settings"><label>最多保留多少份</label><input name="retention_limit" type="number" min="0" required value="{task['retention_limit']}">
+<small class="muted">填 0 表示全部保留，不自动删除。</small></div>
 <div id="file-threads"><label>并行线程数（1-16）</label><input name="transfer_threads" type="number" min="1" max="16" step="1" required value="{task['transfer_threads']}" oninput="if(+this.value>16)this.value=16;if(+this.value<1)this.value=1"></div></div></div>
 <p><label><input type="checkbox" name="enabled" {checked('enabled')}> 启用自动备份</label>
 <label><input type="checkbox" name="auto_install_dependencies" {checked('auto_install_dependencies')}> 首次连接自动安装对应备份客户端</label></p>
@@ -1425,7 +1491,7 @@ tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'lig
         raw = {key: form[key] for key in (
             "name", "remote_host", "remote_port", "remote_user", "remote_path", "ssh_key",
             "backup_dir", "interval_days", "retention_limit", "transfer_threads", "auth_method",
-            "schedule_times", "source_type", "database_host", "database_port", "database_user",
+            "schedule_times", "source_type", "file_mode", "database_host", "database_port", "database_user",
             "database_name",
         ) if key in form}
         raw["enabled"] = "enabled" in form
@@ -1681,7 +1747,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/backup/start":
             task_id = form.get("id", "")
             task = self.app.task(task_id)
-            partial = Path(task["backup_dir"]) / f".partial-{task_id}" if task else None
+            partial = (incremental_ledger(task) if task.get("file_mode") == "incremental" else Path(task["backup_dir"]) / f".partial-{task_id}") if task else None
             source = "网页断点续传" if partial and partial.exists() else "网页"
             ok, message = self.app.start_backup(task_id, source)
             if not ok:
