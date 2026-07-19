@@ -12,7 +12,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/JohnMuyuan/Server-File-backupe
 
 安装器会要求填写公网 IPv4、面板端口、用户名和密码，自动安装依赖、配置服务和防火墙，并通过 Let’s Encrypt 申请可自动续期的短期 IP HTTPS 证书。安装和更新结束时会自检证书链与 IP SAN。
 
-申请和续期证书时，公网 IPv4 必须直接指向这台服务器，且云安全组、防火墙和本机都要允许互联网访问 **TCP 80**。面板使用另外的自定义端口。TCP 80 被占用或处于 NAT/运营商封锁环境时，IP 证书无法签发，安装器会明确报错而不会退回不受信任证书。
+申请和续期证书时，公网 IPv4 必须直接指向这台服务器。安装器优先使用 TCP 80；若端口已被网站占用，会依次尝试 TCP 443 TLS-ALPN、Nginx/Apache 无停机校验，也可通过 `SB_ACME_WEBROOT=/网站根目录` 复用现有网站。面板始终使用 HTTPS，不会把 SSH 密钥和密码暴露在公网明文 HTTP 中。
 
 非交互安装：
 

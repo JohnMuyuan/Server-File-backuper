@@ -321,6 +321,11 @@ class BackupManagerTest(unittest.TestCase):
         self.assertIn('verify_panel_tls()', script)
         self.assertIn('2>&1', script)
         self.assertIn('tls_attempt', script)
+        self.assertIn('SB_ACME_WEBROOT', script)
+        self.assertIn('--alpn --tlsport 443', script)
+        self.assertIn('--nginx', script)
+        self.assertIn('--apache', script)
+        self.assertNotIn('port_free 80 || {', script)
         self.assertIn('tar zstd', script)
         self.assertNotIn(' rsync lftp', script)
 

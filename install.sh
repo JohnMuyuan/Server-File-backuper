@@ -130,26 +130,63 @@ ensure_cron() {
 
 issue_ip_certificate() {
     ip=${1:-${SB_PUBLIC_IP:-}}
+    webroot=${SB_ACME_WEBROOT:-}
     [ -n "$ip" ] || ip=$(detect_ip)
     if [ "${SB_NONINTERACTIVE:-0}" != 1 ] && [ -t 0 ] && [ -r /dev/tty ]; then
         ip=$(prompt "公网 IPv4（证书绑定这个 IP）" "$ip")
     fi
     valid_ipv4 "$ip" || { echo "无法确认有效的公网 IPv4：$ip"; exit 1; }
-    port_free 80 || {
-        echo "TCP 80 已被其他程序占用，Let’s Encrypt 无法校验证书。请释放 80 端口后重试。"
+    if [ -n "$webroot" ]; then
+        [ -d "$webroot" ] && [ -w "$webroot" ] || {
+            echo "网站根目录不存在或不可写：$webroot"; exit 1;
+        }
+        challenge=webroot
+        open_firewall 80
+        echo "80 端口由现有网站提供服务，使用网站根目录完成证书校验：$webroot"
+    elif port_free 80; then
+        challenge=standalone
+        open_firewall 80
+        echo "正在通过 TCP 80 申请 Let’s Encrypt 短期 IP 证书……"
+    elif port_free 443; then
+        challenge=alpn
+        open_firewall 443
+        echo "TCP 80 已被网站占用，自动改用 TCP 443 TLS-ALPN 校验……"
+    elif command -v nginx >/dev/null 2>&1; then
+        challenge=nginx
+        open_firewall 80
+        echo "TCP 80/443 已被 Nginx 占用，使用 Nginx 无停机校验证书……"
+    elif command -v apachectl >/dev/null 2>&1 || command -v apache2ctl >/dev/null 2>&1; then
+        challenge=apache
+        open_firewall 80
+        echo "TCP 80/443 已被 Apache 占用，使用 Apache 无停机校验证书……"
+    elif [ "${SB_NONINTERACTIVE:-0}" != 1 ] && [ -t 0 ] && [ -r /dev/tty ]; then
+        webroot=$(prompt "现有网站根目录（例如 /var/www/html）" "")
+        [ -n "$webroot" ] && [ -d "$webroot" ] && [ -w "$webroot" ] || {
+            echo "网站根目录不存在或不可写，无法安全申请证书。"; exit 1;
+        }
+        challenge=webroot
+        open_firewall 80
+    else
+        echo "TCP 80 和 443 均被占用，也未检测到 Nginx/Apache。请设置 SB_ACME_WEBROOT 为现有网站根目录后重试。"
         exit 1
-    }
-    open_firewall 80
-    echo "正在申请 Let’s Encrypt 短期 IP 证书；请确保云防火墙/安全组已放行 TCP 80……"
+    fi
     if [ ! -x "$ACME" ]; then
         curl -fsSL https://get.acme.sh | sh
     fi
     ensure_cron
     "$ACME" --set-default-ca --server letsencrypt --force
     [ -z "${SB_ACME_EMAIL:-}" ] || "$ACME" --register-account -m "$SB_ACME_EMAIL" --server letsencrypt || true
-    "$ACME" --issue -d "$ip" --standalone --server letsencrypt \
-        --certificate-profile shortlived --days 6 --httpport 80 --force || {
-        echo "证书申请失败。请确认该公网 IP 指向本机，且互联网可访问本机 TCP 80。"
+    set -- --issue -d "$ip" --server letsencrypt \
+        --certificate-profile shortlived --days 6 --force
+    case "$challenge" in
+        standalone) set -- "$@" --standalone --httpport 80 ;;
+        alpn) set -- "$@" --alpn --tlsport 443 ;;
+        nginx) set -- "$@" --nginx ;;
+        apache) set -- "$@" --apache ;;
+        webroot) set -- "$@" --webroot "$webroot" ;;
+    esac
+    "$ACME" "$@" || {
+        echo "证书申请失败。请确认公网 IP 指向本机，且所选校验方式可从互联网访问。"
         exit 1
     }
     install -d -m 700 "$DATA_DIR"
