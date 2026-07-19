@@ -134,12 +134,17 @@ verify_webroot_route() {
     probe_token="simple-backup-$(openssl rand -hex 8)"
     probe_dir="$probe_root/.well-known/acme-challenge"
     probe_file="$probe_dir/$probe_token"
+    probe_result=$(mktemp)
+    probe_url="http://$probe_ip/.well-known/acme-challenge/$probe_token"
     mkdir -p "$probe_dir"
     printf '%s' "$probe_token" >"$probe_file"
-    probe_body=$(curl -4 -fsS --max-time 10 "http://$probe_ip/.well-known/acme-challenge/$probe_token" 2>/dev/null || true)
-    rm -f "$probe_file"
+    if ! probe_status=$(curl -4 -ksSL --max-redirs 10 --max-time 15 -o "$probe_result" -w '%{http_code}' "$probe_url" 2>/dev/null); then
+        probe_status=000
+    fi
+    probe_body=$(cat "$probe_result")
+    rm -f "$probe_file" "$probe_result"
     [ "$probe_body" = "$probe_token" ] || {
-        echo "网站根目录校验失败：公网访问验证文件时没有得到正确内容。"
+        echo "网站根目录校验失败：公网访问验证文件时没有得到正确内容（最终 HTTP 状态：$probe_status）。"
         echo "请在 1Panel 中把对应网站设为默认站点（或绑定 IP $probe_ip），并填写该网站显示的实际根目录，而不是 sites 上级目录。"
         return 1
     }

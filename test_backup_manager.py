@@ -325,6 +325,8 @@ class BackupManagerTest(unittest.TestCase):
         self.assertIn('verify_webroot_route()', script)
         self.assertIn('.well-known/acme-challenge', script)
         self.assertIn('probe_body', script)
+        self.assertIn('probe_status', script)
+        self.assertIn('--max-redirs 10', script)
         self.assertIn('--alpn --tlsport 443', script)
         self.assertIn('--nginx', script)
         self.assertIn('--apache', script)
