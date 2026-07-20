@@ -393,7 +393,8 @@ class BackupManagerTest(unittest.TestCase):
                 "toast-stack", "notice", "tone", "confirm-dialog", "is-loading",
                 "prefers-reduced-motion", "badge", "running", "success", "failed",
                 "@media(max-width:640px)", 'rel="icon"', "brand-icon",
-                "theme-switch", "theme-option", "--header-fg",
+                "theme-switch", "theme-option", "--header-fg", "text-overflow:ellipsis",
+                "task-value", "task-endpoint", "padding-top:28px", ".log-shell pre{margin:0}",
             ):
                 self.assertIn(marker, home)
 
