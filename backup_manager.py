@@ -1244,10 +1244,10 @@ class BackupApp:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{self.esc(title)} - Simple Backup</title>
 <script>document.documentElement.dataset.theme=localStorage.getItem('sb_theme')||'auto'</script><style>
-:root{{--bg:#f4f7fb;--fg:#182230;--card:#fff;--border:#dde5ef;--muted:#667085;--input:#fff}}
-html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#33445d;--muted:#aab7ca;--input:#111c2d}}
-@media(prefers-color-scheme:dark){{html[data-theme=auto]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#33445d;--muted:#aab7ca;--input:#111c2d}}}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif}}
+:root{{--bg:#f5f7fb;--bg-soft:#eef3ff;--fg:#152033;--muted:#697386;--card:#ffffffed;--card-solid:#fff;--border:#dfe5ef;--input:#fff;--primary:#356df3;--primary-hover:#285dd8;--primary-soft:#eaf0ff;--success:#15805d;--success-soft:#e6f7f1;--danger:#cf3f4f;--danger-soft:#fff0f2;--warning:#b76b16;--warning-soft:#fff5e7;--shadow:0 16px 45px #263b6b12;--shadow-hover:0 22px 55px #263b6b1f;--ring:#356df333;--header:#10192bf2}}
+html[data-theme=dark]{{--bg:#0c1320;--bg-soft:#111c30;--fg:#edf3ff;--muted:#9cabc0;--card:#131e30eb;--card-solid:#131e30;--border:#293750;--input:#0e1828;--primary:#6790ff;--primary-hover:#83a5ff;--primary-soft:#1c315d;--success:#47c79b;--success-soft:#153a35;--danger:#ff7281;--danger-soft:#401f29;--warning:#f0b45b;--warning-soft:#3d3020;--shadow:0 18px 55px #0006;--shadow-hover:0 24px 65px #0008;--ring:#7fa1ff44;--header:#09111ef2}}
+@media(prefers-color-scheme:dark){{html[data-theme=auto]{{--bg:#0c1320;--bg-soft:#111c30;--fg:#edf3ff;--muted:#9cabc0;--card:#131e30eb;--card-solid:#131e30;--border:#293750;--input:#0e1828;--primary:#6790ff;--primary-hover:#83a5ff;--primary-soft:#1c315d;--success:#47c79b;--success-soft:#153a35;--danger:#ff7281;--danger-soft:#401f29;--warning:#f0b45b;--warning-soft:#3d3020;--shadow:0 18px 55px #0006;--shadow-hover:0 24px 65px #0008;--ring:#7fa1ff44;--header:#09111ef2}}}}
+*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;min-height:100vh;background:radial-gradient(circle at 8% 0,var(--bg-soft),transparent 32rem),var(--bg);color:var(--fg);font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;-webkit-font-smoothing:antialiased}}
 header{{background:#17243b;color:white;padding:16px}}nav{{max-width:1100px;margin:auto;display:flex;gap:18px;align-items:center;flex-wrap:wrap}}
 nav b{{font-size:20px;margin-right:auto}}a{{color:#1769aa;text-decoration:none}}nav a{{color:white}}
 main{{max-width:1100px;margin:28px auto;padding:0 14px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:24px}}
@@ -1265,15 +1265,48 @@ pre{{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1
 .queue-list{{display:grid;gap:0}}.queue-item{{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--border)}}.queue-item time{{color:var(--muted);white-space:nowrap}}details summary{{cursor:pointer;padding-top:10px;color:#1769aa}}
 @media(max-width:640px){{header{{padding:12px 10px}}nav{{gap:12px}}nav b{{width:100%;margin:0}}main{{margin:16px auto;padding:0 10px}}.grid{{grid-template-columns:minmax(0,1fr);gap:16px}}.card{{padding:15px}}main>.card{{margin-top:16px}}input,select{{font-size:16px}}button,.btn{{min-height:42px}}.metric{{font-size:21px}}table{{min-width:620px}}.queue-item{{align-items:flex-start}}.queue-item time{{font-size:13px}}}}
 @media(hover:none){{.disk-tip{{display:block;position:static;transform:none;margin-top:10px;min-width:0}}}}
+html{{scroll-behavior:smooth}}body{{min-height:100vh;background:radial-gradient(circle at 8% 0,var(--bg-soft),transparent 32rem),var(--bg);font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;-webkit-font-smoothing:antialiased}}
+header{{position:sticky;top:0;z-index:20;padding:0;background:var(--header);border-bottom:1px solid #ffffff12;backdrop-filter:blur(18px);box-shadow:0 8px 30px #0001}}
+nav{{max-width:1240px;min-height:68px;padding:9px 20px;gap:7px;flex-wrap:nowrap}}nav b{{display:flex;align-items:center;gap:11px;color:#fff;font-size:18px;letter-spacing:-.02em}}nav b:before{{content:'SB';width:35px;height:35px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(145deg,#7da0ff,#356df3);box-shadow:0 8px 24px #356df366;font-size:12px}}
+nav a{{color:#b9c5d8;padding:9px 12px;border-radius:10px;font-weight:650;transition:background .18s,color .18s,transform .18s}}nav a:hover{{background:#ffffff12;color:#fff}}nav a.active{{background:#ffffff18;color:#fff;box-shadow:inset 0 0 0 1px #ffffff12}}nav a[href='/task']{{background:var(--primary);color:#fff}}nav a[href='/task']:hover{{background:var(--primary-hover);transform:translateY(-1px)}}
+main{{max-width:1240px;margin:0 auto;padding:34px 20px 64px}}h1,h2,h3{{letter-spacing:-.025em;line-height:1.22}}h1{{font-size:clamp(26px,4vw,36px)}}h2{{font-size:19px}}.grid{{grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:24px}}
+.card{{position:relative;background:var(--card);border-color:var(--border);border-radius:18px;padding:24px;box-shadow:var(--shadow);backdrop-filter:blur(16px);animation:card-in .38s cubic-bezier(.2,.75,.25,1) both;transition:transform .22s,border-color .22s,box-shadow .22s}}.card:hover{{border-color:var(--primary);box-shadow:var(--shadow-hover)}}main>.card{{margin-top:26px}}.grid>.card:nth-child(2){{animation-delay:.05s}}.grid>.card:nth-child(3){{animation-delay:.1s}}
+@keyframes card-in{{from{{opacity:0;transform:translateY(10px)}}to{{opacity:1;transform:none}}}}@keyframes pulse{{50%{{opacity:.45;transform:scale(.78)}}}}@keyframes shimmer{{to{{background-position:200% 0}}}}@keyframes spin{{to{{transform:rotate(360deg)}}}}
+.muted{{color:var(--muted)}}.ok{{color:var(--success)}}.bad{{color:var(--danger)}}label{{margin-top:16px;font-weight:680}}input,select{{padding:11px 12px;border-radius:10px;outline:0;transition:border-color .18s,box-shadow .18s}}input:hover,select:hover{{border-color:var(--primary)}}input:focus,select:focus{{border-color:var(--primary);box-shadow:0 0 0 4px var(--ring)}}input[type=checkbox]{{accent-color:var(--primary)}}
+button,.btn{{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:40px;border:1px solid transparent;border-radius:10px;padding:9px 14px;background:var(--primary);font-weight:720;box-shadow:0 8px 20px #356df324;transition:transform .16s,background .16s,box-shadow .16s,opacity .16s}}button:hover,.btn:hover{{background:var(--primary-hover);transform:translateY(-1px);box-shadow:0 11px 25px #356df338}}button:active,.btn:active{{transform:translateY(1px) scale(.985)}}button:disabled{{opacity:.65;cursor:wait;transform:none}}.danger{{background:var(--danger);box-shadow:none}}.secondary{{background:var(--card-solid);color:var(--fg);border-color:var(--border);box-shadow:none}}.secondary:hover{{background:var(--bg-soft)}}small{{display:block;margin-top:6px}}
+.theme-icon{{width:39px;padding:0;border-color:transparent;box-shadow:none}}.theme-icon:hover{{box-shadow:none}}.theme-icon.changed{{transform:rotate(28deg) scale(1.12)}}
+.badge{{display:inline-flex;align-items:center;gap:7px;padding:5px 9px;border-radius:999px;background:var(--bg-soft);color:var(--muted);font-size:12px;font-weight:750}}.badge.running{{background:var(--primary-soft);color:var(--primary)}}.badge.success{{background:var(--success-soft);color:var(--success)}}.badge.failed{{background:var(--danger-soft);color:var(--danger)}}.badge.waiting{{background:var(--warning-soft);color:var(--warning)}}.status-dot{{width:7px;height:7px;border-radius:50%;background:currentColor}}.running .status-dot{{animation:pulse 1.25s infinite}}
+.donut{{position:relative;width:156px;height:156px;box-shadow:inset 0 0 0 1px var(--border)}}.donut:after{{position:absolute;width:112px;height:112px;background:var(--card-solid);box-shadow:0 5px 20px #0001}}.donut-value{{position:absolute;z-index:1;font-size:25px;font-weight:820;letter-spacing:-.04em}}.disk-tip{{bottom:18px;display:block;opacity:0;pointer-events:none;transform:translate(-50%,8px);border-radius:11px;box-shadow:0 18px 40px #0005;transition:opacity .18s,transform .18s}}.disk-wrap:hover .disk-tip{{opacity:1;transform:translate(-50%,0)}}
+pre{{padding:16px;border-radius:12px;max-height:520px;box-shadow:inset 0 1px 7px #0000000b;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}}.log-shell{{position:relative}}.log-shell:before{{content:'LIVE';position:absolute;right:13px;top:11px;z-index:2;padding:3px 7px;border-radius:6px;background:var(--success-soft);color:var(--success);font-size:10px;font-weight:850;letter-spacing:.1em}}
+.progress{{height:9px}}.progress>span{{background:linear-gradient(90deg,var(--primary),#83a5ff,var(--primary));background-size:200% 100%;transition:width .45s cubic-bezier(.2,.8,.2,1);animation:shimmer 2.2s linear infinite}}.metric{{font-size:30px;font-weight:800;letter-spacing:-.04em}}th{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}}
+.running-list{{display:grid;gap:13px}}.running-card{{padding:16px;border:1px solid var(--border);border-radius:13px;background:var(--input);animation:card-in .25s both}}.running-top{{display:flex;gap:10px;align-items:center;margin-bottom:10px}}.running-meta{{display:flex;justify-content:space-between;gap:12px;margin:8px 0 0;color:var(--muted);font-size:13px}}.task-card{{display:flex;flex-direction:column;gap:12px}}.task-card .row:last-child{{margin-top:auto;padding-top:5px}}.empty-state{{text-align:center;padding:30px 18px;color:var(--muted)}}
+.page-heading{{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:24px}}.page-heading h1{{margin:0 0 4px}}.page-heading p{{margin:0}}.card-heading{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}}.card-heading h1,.card-heading h2{{margin:0}}.card-kicker{{color:var(--primary);font-size:11px;font-weight:850;letter-spacing:.11em;text-transform:uppercase}}
+.task-meta{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 18px;padding:13px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}}.task-meta span{{min-width:0}}.task-meta b{{display:block;color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase}}.task-meta code{{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}}
+.form-shell{{max-width:980px;margin-inline:auto}}.form-section{{margin-top:22px;padding:22px;border:1px solid var(--border);border-radius:15px;background:var(--input)}}.form-section:first-of-type{{margin-top:0}}.section-heading{{display:flex;align-items:flex-start;gap:12px;margin-bottom:17px}}.section-icon{{flex:0 0 34px;width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:var(--primary-soft);color:var(--primary);font-weight:850}}.section-heading h2{{margin:0 0 3px}}.section-heading p{{margin:0;color:var(--muted);font-size:13px}}.form-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 18px}}.form-grid>.wide{{grid-column:1/-1}}.form-actions{{position:sticky;bottom:12px;z-index:5;display:flex;justify-content:flex-end;gap:10px;margin-top:22px;padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--card);box-shadow:0 12px 38px #0002;backdrop-filter:blur(14px)}}.check-row{{display:flex;gap:18px;flex-wrap:wrap}}.check-row label{{margin:0;display:flex;align-items:center;gap:8px}}
+.settings-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}}.settings-grid .card{{margin:0}}.form-section.compact{{padding:18px;margin-top:18px}}.form-actions.inner{{position:static;justify-content:flex-start;padding:0;margin-top:18px;border:0;background:transparent;box-shadow:none;backdrop-filter:none}}.settings-actions{{margin-top:24px}}.table-scroll{{overflow:auto;border:1px solid var(--border);border-radius:13px}}.table-scroll table{{min-width:680px}}.table-scroll th,.table-scroll td{{padding:12px 14px}}.slot-speed{{font-weight:800;color:var(--primary)}}.mini-progress{{width:96px;height:5px;margin-top:5px;border-radius:99px;background:var(--border);overflow:hidden}}.mini-progress span{{display:block;height:100%;background:var(--primary)}}
+.metric.flash{{animation:metric-flash .28s ease}}@keyframes metric-flash{{50%{{color:var(--primary);transform:translateY(-1px)}}}}.inline-error{{padding:12px 14px;border:1px solid var(--danger);border-radius:11px;background:var(--danger-soft);color:var(--danger)}}
+.toast-stack{{position:fixed;z-index:60;right:20px;top:82px;display:grid;gap:10px;width:min(390px,calc(100% - 28px))}}.toast{{display:flex;align-items:flex-start;gap:11px;padding:14px 15px;background:var(--card-solid);border:1px solid var(--border);border-left:4px solid var(--primary);border-radius:13px;box-shadow:0 20px 55px #0003;animation:toast-in .3s cubic-bezier(.2,.8,.2,1) both}}.toast.success{{border-left-color:var(--success)}}.toast.error{{border-left-color:var(--danger)}}.toast.out{{opacity:0;transform:translateX(15px);transition:.22s}}@keyframes toast-in{{from{{opacity:0;transform:translateX(20px)}}}}
+dialog{{width:min(430px,calc(100% - 28px));padding:0;border:1px solid var(--border);border-radius:18px;background:var(--card-solid);color:var(--fg);box-shadow:0 28px 90px #0007}}dialog::backdrop{{background:#07101fb8;backdrop-filter:blur(4px)}}.dialog-body{{padding:24px}}.dialog-body h2{{margin-top:0}}.dialog-actions{{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}}
+.is-loading:before{{content:'';width:13px;height:13px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}}
+@media(max-width:850px){{nav{{flex-wrap:wrap}}nav b{{width:calc(100% - 52px)}}nav a{{flex:1;text-align:center}}nav a[href='/task']{{order:3;flex-basis:100%}}main{{padding-top:24px}}.settings-grid{{grid-template-columns:1fr}}}}
+@media(max-width:640px){{header{{position:static}}nav{{padding:10px;gap:5px}}nav b{{width:calc(100% - 46px);padding:3px}}nav b:before{{width:32px;height:32px}}nav a{{font-size:13px;padding:8px 5px}}nav a[href='/logout']{{display:none}}main{{padding:20px 11px 44px}}.grid{{gap:18px}}.card{{padding:18px;border-radius:15px}}main>.card{{margin-top:20px}}.page-heading{{display:block;margin-bottom:18px}}.page-heading .btn{{margin-top:12px;width:100%}}.task-card .row button,.task-card .row .btn{{flex:1}}.task-meta,.form-grid{{grid-template-columns:1fr}}.form-section{{padding:16px;margin-top:16px}}.form-actions{{bottom:7px}}.form-actions button{{flex:1}}.toast-stack{{top:12px;right:14px}}.disk-tip{{opacity:1;transform:none;position:static;margin-top:12px}}}}
+@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}}}
 </style></head><body><header><nav><b>Simple Backup</b><a href="/">首页</a><a href="/tasks">任务</a>
 <a href="/task">新建任务</a><a href="/logs">日志</a><a href="/settings">设置</a><button type="button" class="theme-icon" id="theme" aria-label="切换主题" title="切换主题">◐</button><a href="/logout">退出</a></nav></header>
-<main>{body}</main><script>document.querySelectorAll('form').forEach(f=>{{
-if(f.method.toLowerCase()==='post'){{let i=document.createElement('input');i.type='hidden';i.name='csrf';i.value='{csrf}';f.appendChild(i)}}}});
+<main>{body}</main><div class='toast-stack' id='toast-stack' aria-live='polite'></div><dialog id='confirm-dialog'><div class='dialog-body'><h2>确认操作</h2><p id='confirm-message'></p><div class='dialog-actions'><button type='button' class='secondary' id='confirm-cancel'>取消</button><button type='button' class='danger' id='confirm-ok'>确认</button></div></div></dialog><script>
+const addHidden=(f,n,v)=>{{let i=f.querySelector('input[name='+n+']');if(!i){{i=document.createElement('input');i.type='hidden';i.name=n;f.appendChild(i)}}i.value=v}};
+document.querySelectorAll('form').forEach(f=>{{if(f.method.toLowerCase()==='post'){{addHidden(f,'csrf','{csrf}');addHidden(f,'return_to',location.pathname+location.search)}}}});
+let current=location.pathname==='/'?'home':location.pathname==='/tasks'||location.pathname==='/task'&&location.search?'tasks':location.pathname==='/task'?'new':location.pathname.startsWith('/logs')?'logs':location.pathname==='/settings'?'settings':'';
+let navLinks=[...document.querySelectorAll('nav a')];let activeLink=current==='home'?navLinks.find(a=>a.getAttribute('href')==='/'):navLinks.find(a=>current==='tasks'&&a.getAttribute('href')==='/tasks'||current==='new'&&a.getAttribute('href')==='/task'||current==='logs'&&a.getAttribute('href')==='/logs'||current==='settings'&&a.getAttribute('href')==='/settings');activeLink?.classList.add('active');
 const tailLogs=()=>document.querySelectorAll('pre.tail-log').forEach(p=>p.scrollTop=p.scrollHeight);
 addEventListener('pageshow',()=>requestAnimationFrame(tailLogs));
 const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}},ti={{auto:'◐',light:'☀',dark:'☾'}};
 function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent=ti[t];tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title);if(feedback){{tb.classList.remove('changed');void tb.offsetWidth;tb.classList.add('changed');setTimeout(()=>tb.classList.remove('changed'),220)}}}}
 tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);
+const params=new URLSearchParams(location.search),notice=params.get('notice'),tone=params.get('tone')||'success';if(notice){{let box=document.getElementById('toast-stack'),toast=document.createElement('div');toast.className='toast '+tone;let dot=document.createElement('span'),copy=document.createElement('div'),heading=document.createElement('b'),detail=document.createElement('div');dot.className='status-dot';heading.textContent=tone==='error'?'操作失败':'操作完成';detail.textContent=notice;copy.append(heading,detail);toast.append(dot,copy);box.append(toast);setTimeout(()=>{{toast.classList.add('out');setTimeout(()=>toast.remove(),240)}},4200);params.delete('notice');params.delete('tone');history.replaceState(null,'',location.pathname+(params.size?'?'+params.toString():'')+location.hash)}}
+const dialog=document.getElementById('confirm-dialog'),message=document.getElementById('confirm-message');let pending=null,confirmed=false;document.querySelectorAll('form').forEach(f=>{{let action=f.getAttribute('action');if(action==='/backup/stop'){{f.removeAttribute('onsubmit');f.dataset.confirm='停止后会清除本次已下载的数据，且无法断点续传。确定停止并清除？'}}if(action==='/task/delete'){{f.removeAttribute('onsubmit');f.dataset.confirm='只删除任务设置，不删除已有备份。确定删除？'}}}});
+document.getElementById('confirm-cancel').onclick=()=>{{pending=null;dialog.close()}};document.getElementById('confirm-ok').onclick=()=>{{let item=pending;pending=null;confirmed=true;dialog.close();item?.form.requestSubmit(item.submitter)}};
+document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',e=>{{let submitter=e.submitter||f.querySelector('button'),text=submitter?.dataset.confirm||f.dataset.confirm;if(text&&!confirmed){{e.preventDefault();pending={{form:f,submitter}};message.textContent=text;dialog.showModal();return}}confirmed=false;if(submitter){{submitter.disabled=true;submitter.classList.add('is-loading');submitter.dataset.original=submitter.textContent;submitter.textContent=submitter.dataset.loading||'处理中…'}}}}));
 const am=document.getElementById('auth-method'),ka=document.getElementById('key-auth'),pa=document.getElementById('password-auth');
 function authUI(){{if(!am)return;ka.hidden=am.value!=='key';pa.hidden=am.value!=='password'}}if(am){{am.onchange=authUI;authUI()}}
 const so=document.getElementById('source-type'),fm=document.getElementById('file-mode'),fs=document.getElementById('file-source'),ds=document.getElementById('database-source'),ft=document.getElementById('file-threads'),rs=document.getElementById('retention-settings'),rp=document.getElementById('remote-path'),du=document.getElementById('database-user'),dn=document.getElementById('database-name');
@@ -1316,8 +1349,8 @@ st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelector
             used = usage.total - usage.free
             percent = round(used / usage.total * 100, 1) if usage.total else 0
             details = "\n".join(f"{name}：{human_size(size)}" for name, size in entry["tasks"]) or "暂无任务备份"
-            disk_cards.append(f"""<section class="card disk-wrap"><h2>备份磁盘</h2>
-<div class="donut" style="background:conic-gradient(#1769aa {percent}%,var(--border) 0)"></div>
+            disk_cards.append(f"""<section class="card disk-wrap"><div class="card-heading"><div><span class="card-kicker">Storage</span><h2>备份磁盘</h2></div><span class="badge waiting"><span class="status-dot"></span>{human_size(usage.free)} 可用</span></div>
+<div class="donut" style="background:conic-gradient(var(--primary) {percent}%,var(--border) 0)"><span class="donut-value">{percent}%</span></div>
 <p><b>{percent}%</b> · 已用 {human_size(used)} / {human_size(usage.total)}<br><span class="muted">{self.esc(entry['path'])}</span></p>
 <div class="disk-tip">{self.esc(details)}</div></section>""")
         queue = []
@@ -1340,23 +1373,24 @@ st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelector
             + "</div>"
             if queue_items else "<p class='muted'>暂无启用的自动任务</p>"
         )
-        body = f"""<div class="grid">{''.join(disk_cards) or '<section class="card"><h2>备份磁盘</h2><p class="muted">创建任务后显示</p></section>'}
-<section class="card"><h2>当前网速</h2><div class="row"><div style="flex:1"><span class="muted">↓ 下载</span><p class="metric" id="net-rx">计算中…</p></div><div style="flex:1"><span class="muted">↑ 上传</span><p class="metric" id="net-tx">计算中…</p></div></div><p class="muted">统计本机除回环接口外的实时流量</p></section>
-<section class="card"><h2>后续备份队列</h2>{queue_html}</section></div>
-<section class="card"><h2>正在运行</h2><div id="running">读取中…</div></section>
-<section class="card"><div class="row"><h2 style="margin-right:auto">最近日志</h2><a href="/logs">查看全部完整日志</a></div>
-<pre class="tail-log">{self.esc(self.read_log(40_000))}</pre></section>
+        body = f"""<div class="page-heading"><div><span class="card-kicker">Overview</span><h1>备份控制台</h1><p class="muted">磁盘、网络、队列和任务状态集中在这里。</p></div><a class="btn" href="/task">＋ 新建备份任务</a></div>
+<div class="grid">{''.join(disk_cards) or '<section class="card"><h2>备份磁盘</h2><p class="muted">创建任务后显示</p></section>'}
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Network</span><h2>当前网速</h2></div><span class="badge running"><span class="status-dot"></span>实时</span></div><div class="row"><div style="flex:1"><span class="muted">↓ 下载</span><p class="metric" id="net-rx">计算中…</p></div><div style="flex:1"><span class="muted">↑ 上传</span><p class="metric" id="net-tx">计算中…</p></div></div><p class="muted">统计本机除回环接口外的实时流量</p></section>
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Schedule</span><h2>后续备份队列</h2></div></div>{queue_html}</section></div>
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Live Jobs</span><h2>正在运行</h2></div><a href="/tasks">管理任务</a></div><div class="running-list" id="running"><p class="muted">读取中…</p></div></section>
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Activity</span><h2>最近日志</h2></div><a href="/logs">查看全部完整日志</a></div>
+<div class="log-shell"><pre class="tail-log">{self.esc(self.read_log(40_000))}</pre></div></section>
 <script>let nr=0,nw=0,nt=0;async function live(){{let r=await fetch('/api/status'),d=await r.json(),now=Date.now();
-if(nt){{let seconds=(now-nt)/1000;document.getElementById('net-rx').textContent=(Math.max(0,d.network_rx-nr)/1024/1024/seconds).toFixed(2)+' MB/s';document.getElementById('net-tx').textContent=(Math.max(0,d.network_tx-nw)/1024/1024/seconds).toFixed(2)+' MB/s'}}
+if(nt){{let seconds=(now-nt)/1000;[['net-rx',Math.max(0,d.network_rx-nr)],['net-tx',Math.max(0,d.network_tx-nw)]].forEach(([id,value])=>{{let el=document.getElementById(id);el.textContent=(value/1024/1024/seconds).toFixed(2)+' MB/s';el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash')}})}}
 nr=d.network_rx;nw=d.network_tx;nt=now;let box=document.getElementById('running');box.replaceChildren();
-if(d.running.length)d.running.forEach(x=>{{let p=document.createElement('p'),b=document.createElement('b');b.textContent=x.name;let detail=x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s';p.append(b,' · '+x.phase+' · '+detail);box.append(p)}});
+if(d.running.length)d.running.forEach(x=>{{let card=document.createElement('div'),top=document.createElement('div'),name=document.createElement('b'),badge=document.createElement('span'),dot=document.createElement('span'),bar=document.createElement('div'),fill=document.createElement('span'),meta=document.createElement('div'),left=document.createElement('span'),right=document.createElement('span');card.className='running-card';top.className='running-top';name.textContent=x.name;badge.className='badge running';dot.className='status-dot';badge.append(dot,x.phase);top.append(name,badge);bar.className='progress';fill.style.width=x.total_bytes?x.progress+'%':'18%';bar.append(fill);meta.className='running-meta';left.textContent=x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · 正在计算总大小';right.textContent=fmt(x.speed_bps)+'/s';meta.append(left,right);card.append(top,bar,meta);box.append(card)}});
 else{{let p=document.createElement('p');p.className='muted';p.textContent='当前没有运行中的备份';box.append(p)}}}}
 function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}live();setInterval(live,2000);</script>"""
         return self.page("首页", body, token)
 
     def logs_html(self, token):
-        return self.page("日志", f"""<section class="card"><div class="row"><h1 style="margin-right:auto">全部应用日志</h1>
-<a class="btn secondary" href="/logs/raw">下载全部日志</a></div><p class="muted">包含当前日志和轮转日志，打开时自动定位到最新一行。</p><pre class="tail-log">{self.esc(self.read_log(None))}</pre></section>""", token)
+        return self.page("日志", f"""<div class="page-heading"><div><span class="card-kicker">Diagnostics</span><h1>全部应用日志</h1><p class="muted">包含当前日志和轮转日志，打开时自动定位到最新一行。</p></div><a class="btn secondary" href="/logs/raw">下载全部日志</a></div>
+<section class="card"><div class="log-shell"><pre class="tail-log">{self.esc(self.read_log(None))}</pre></div></section>""", token)
 
     def dashboard_html(self, token):
         cards = []
@@ -1369,31 +1403,33 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
                 f"{job.get('phase', '运行中')} · 已传输 {human_size(job.get('transferred_bytes', 0))} · {human_size(job.get('speed_bps', 0))}/s"
                 if job else state.get("last_result", "尚未运行")
             )
+            result = state.get("last_result", "尚未运行")
+            status_kind = "running" if job else "failed" if state.get("last_error") or result == "失败" else "success" if result == "成功" else "waiting"
             next_run = datetime.fromtimestamp(state["next_run"]).strftime("%Y-%m-%d %H:%M") if state.get("next_run") else "待安排"
             error = f"<p class='bad'>原因：{self.esc(state.get('last_error'))}</p>" if state.get("last_error") else ""
             partial = incremental_ledger(task) if task.get("file_mode") == "incremental" else Path(task["backup_dir"]) / f".partial-{task['id']}"
             if job:
                 action = (
-                    f"<form class='inline' method='post' action='/backup/pause'><input type='hidden' name='id' value='{task['id']}'><button class='secondary'>临时暂停</button></form>"
-                    f"<form class='inline' method='post' action='/backup/stop' onsubmit=\"return confirm('停止后会清除本次已下载的数据，且无法断点续传。确定？')\"><input type='hidden' name='id' value='{task['id']}'><button class='danger'>停止并清除</button></form>"
+                    f"<form class='inline' method='post' action='/backup/pause'><input type='hidden' name='id' value='{task['id']}'><button class='secondary' data-loading='正在暂停…'>临时暂停</button></form>"
+                    f"<form class='inline' method='post' action='/backup/stop' onsubmit=\"return confirm('停止后会清除本次已下载的数据，且无法断点续传。确定？')\"><input type='hidden' name='id' value='{task['id']}'><button class='danger' data-loading='正在停止…'>停止并清除</button></form>"
                 )
             else:
                 label = "继续备份" if partial.exists() or state.get("last_result") == "已暂停" else "立即备份"
-                action = f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task['id']}'><button>{label}</button></form>"
+                action = f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task['id']}'><button data-loading='正在启动…'>{label}</button></form>"
             if task["source_type"] == "files":
                 mode = {"incremental": "（增量归档，只新增）", "mirror": "（完全镜像同步）"}.get(task.get("file_mode"), "")
                 source = self.esc(task["remote_path"] + mode)
             else:
                 port = task["database_port"] or {"mysql": 3306, "postgresql": 5432, "redis": 6379}[task["source_type"]]
                 source = self.esc(f"{task['source_type']}://{task['database_host']}:{port}/{task['database_name'] or '整个实例'}")
-            cards.append(f"""<section class="card"><h2>{self.esc(task['name'])}</h2>
+            cards.append(f"""<section class="card task-card"><div class="card-heading"><div><span class="card-kicker">Backup Task</span><h2>{self.esc(task['name'])}</h2></div><span class="badge {status_kind}"><span class="status-dot"></span>{self.esc(status)}</span></div>
 <p class="muted">ID {task['id']} · {self.esc(task['remote_user'])}@{self.esc(task['remote_host'])}:{task['remote_port']}</p>
-<p><b>状态：</b>{self.esc(status)}　<b>下次：</b>{next_run}</p>
-<p><b>来源：</b>{source}<br><b>本地：</b>{self.esc(task['backup_dir'])}</p>
-<p><b>最近备份：</b>{self.esc(state.get('last_backup') or '无')}</p>{error}<div class="row">{action}
+<div class="task-meta"><span><b>下次执行</b>{next_run}</span><span><b>最近备份</b>{self.esc(state.get('last_backup') or '无')}</span><span><b>备份来源</b><code>{source}</code></span><span><b>本地目录</b><code>{self.esc(task['backup_dir'])}</code></span></div>
+{error}<div class="row">{action}
 <a class="btn secondary" href="/task/detail?id={task['id']}">详情</a><a class="btn secondary" href="/task?id={task['id']}">编辑</a></div></section>""")
-        empty = "<section class='card'><h2>还没有备份任务</h2><p>点击“新建任务”，只需填写服务器和路径即可开始。</p></section>"
-        return self.page("任务", "<div class='grid'>" + ("".join(cards) or empty) + "</div>", token)
+        empty = "<section class='card empty-state'><h2>还没有备份任务</h2><p>点击“新建任务”，只需填写服务器和路径即可开始。</p><a class='btn' href='/task'>创建第一个任务</a></section>"
+        heading = "<div class='page-heading'><div><span class='card-kicker'>Tasks</span><h1>备份任务</h1><p class='muted'>查看状态、立即运行或进入任务详情。</p></div><a class='btn' href='/task'>＋ 新建任务</a></div>"
+        return self.page("任务", heading + "<div class='grid'>" + ("".join(cards) or empty) + "</div>", token)
 
     def task_detail_html(self, task, token):
         if not task:
@@ -1406,15 +1442,24 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
         transferred = job.get("transferred_bytes", 0) if job else 0
         total = job.get("total_bytes", 0) if job else 0
         plan = f"并行连接 {job.get('parallel_files', 1)} 条 · 固定清单传输" if job else "等待任务开始"
-        body = f"""<section class="card"><div class="row"><div style="margin-right:auto"><h1>{self.esc(task['name'])}</h1>
-<p class="muted">任务 ID {task_id} · {self.esc(task['remote_user'])}@{self.esc(task['remote_host'])}</p></div><a class="btn secondary" href="/task?id={task_id}">编辑</a></div>
-<h2 id="detail-phase">{self.esc(phase)}</h2><div class="progress"><span id="detail-bar" style="width:{progress}%"></span></div>
+        status_kind = "running" if job else "failed" if state.get("last_error") or phase == "失败" else "success" if phase == "成功" else "waiting"
+        partial = incremental_ledger(task) if task.get("file_mode") == "incremental" else Path(task["backup_dir"]) / f".partial-{task_id}"
+        if job:
+            action = (
+                f"<form class='inline' method='post' action='/backup/pause'><input type='hidden' name='id' value='{task_id}'><button class='secondary' data-loading='正在暂停…'>临时暂停</button></form>"
+                f"<form class='inline' method='post' action='/backup/stop'><input type='hidden' name='id' value='{task_id}'><button class='danger' data-loading='正在停止…'>停止并清除</button></form>"
+            )
+        else:
+            label = "继续备份" if partial.exists() or state.get("last_result") == "已暂停" else "立即备份"
+            action = f"<form class='inline' method='post' action='/backup/start'><input type='hidden' name='id' value='{task_id}'><button data-loading='正在启动…'>{label}</button></form>"
+        body = f"""<div class="page-heading"><div><span class="card-kicker">Task Detail</span><h1>{self.esc(task['name'])}</h1><p class="muted">任务 ID {task_id} · {self.esc(task['remote_user'])}@{self.esc(task['remote_host'])}</p></div><div class="row">{action}<a class="btn secondary" href="/task?id={task_id}">编辑设置</a></div></div>
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Overall Progress</span><h2 id="detail-phase">{self.esc(phase)}</h2></div><span class="badge {status_kind}" id="detail-badge"><span class="status-dot"></span>{self.esc(phase)}</span></div><div class="progress"><span id="detail-bar" style="width:{progress}%"></span></div>
 <p id="detail-summary">{progress}% · {human_size(transferred)} / {human_size(total) if total else '总大小暂未取得'}</p><p class="muted" id="detail-plan">并发策略：{plan}</p>
 <p class="muted">多线程模式下显示活跃传输槽位。槽位速度和已传输量来自本地断点文件的实际增长；百分比为整个任务的总体进度。</p></section>
-<section class="card"><h2>活跃传输槽位</h2><div style="overflow:auto"><table><thead><tr><th>槽位</th><th>当前文件</th><th>速度</th><th>已传输</th><th>任务进度</th></tr></thead><tbody id="slot-rows"><tr><td colspan="5" class="muted">暂无活跃传输</td></tr></tbody></table></div></section>
-<section class="card"><div class="row"><h2 style="margin-right:auto">该任务的全部日志</h2><a class="btn secondary" href="/logs">全部应用日志</a></div><pre class="tail-log" id="task-log">{self.esc(self.read_task_log(task_id))}</pre></section>
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Transfers</span><h2>活跃传输槽位</h2></div><span class="muted">每 2 秒刷新</span></div><div class="table-scroll"><table><thead><tr><th>槽位</th><th>当前文件</th><th>速度</th><th>已传输</th><th>任务进度</th></tr></thead><tbody id="slot-rows"><tr><td colspan="5" class="muted">暂无活跃传输</td></tr></tbody></table></div></section>
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Task Logs</span><h2>该任务的全部日志</h2></div><a class="btn secondary" href="/logs">全部应用日志</a></div><div class="log-shell"><pre class="tail-log" id="task-log">{self.esc(self.read_task_log(task_id))}</pre></div></section>
 <script>const taskId={json.dumps(task_id)};function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}
-async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');document.getElementById('detail-plan').textContent='并发策略：'+x.parallel_files+' 条 rsync 连接 · 固定清单传输';if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow();['#'+s.slot,s.name,fmt(s.speed_bps)+'/s',fmt(s.bytes),s.progress+'%'].forEach(v=>{{let td=tr.insertCell();td.textContent=v}})}})}}
+async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;let badge=document.getElementById('detail-badge');badge.className='badge running';badge.lastChild.textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');document.getElementById('detail-plan').textContent='并发策略：'+x.parallel_files+' 条 rsync 连接 · 固定清单传输';if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow(),slot=tr.insertCell(),file=tr.insertCell(),speed=tr.insertCell(),bytes=tr.insertCell(),progressCell=tr.insertCell(),mini=document.createElement('div'),fill=document.createElement('span');slot.textContent='#'+s.slot;file.textContent=s.name;speed.textContent=fmt(s.speed_bps)+'/s';speed.className='slot-speed';bytes.textContent=fmt(s.bytes);progressCell.append(s.progress+'%');mini.className='mini-progress';fill.style.width=s.progress+'%';mini.append(fill);progressCell.append(mini)}})}}
 async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURIComponent(taskId)),p=document.getElementById('task-log'),t=await r.text(),follow=p.scrollHeight-p.scrollTop-p.clientHeight<40;p.textContent=t;if(follow)p.scrollTop=p.scrollHeight}}detail();setInterval(detail,2000);setInterval(taskLog,5000);</script>"""
         return self.page("任务详情", body, token)
 
@@ -1434,80 +1479,77 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
         backup_rows = "".join(
             f"<div class='row'><code>{self.esc(p.name)}</code><span class='muted'>{human_size(directory_size(p))}</span>"
             f"<form class='inline' method='post' action='/backup/delete'><input type='hidden' name='id' value='{task_id}'>"
-            f"<input type='hidden' name='name' value='{self.esc(p.name)}'><button class='danger'>删除</button></form></div>"
+            f"<input type='hidden' name='name' value='{self.esc(p.name)}'><button class='danger' data-loading='正在删除…' data-confirm='确定删除这个备份文件？此操作不可恢复。'>删除</button></form></div>"
             for p in reversed(backups[-30:])
         )
         delete_task = (
-            f"<form method='post' action='/task/delete' onsubmit=\"return confirm('只删除任务设置，不删除已有备份。确定？')\">"
-            f"<input type='hidden' name='id' value='{task_id}'><button class='danger'>删除此任务</button></form>"
+            f"<form method='post' action='/task/delete'>"
+            f"<input type='hidden' name='id' value='{task_id}'><button class='danger' data-loading='正在删除…' data-confirm='只删除任务设置，不删除已有备份。确定删除此任务？'>删除此任务</button></form>"
             if task_id else ""
         )
-        body = f"""<section class="card"><h1>{'编辑任务' if task_id else '新建备份任务'}</h1>
-<form method="post" action="/task/save"><input type="hidden" name="id" value="{task_id}">
-<label>任务名称</label><input name="name" required maxlength="50" value="{self.esc(task['name'])}">
-<label>备份类型</label><select id="source-type" name="source_type"><option value="files" {source_selected('files')}>文件 / 目录</option><option value="mysql" {source_selected('mysql')}>MySQL / MariaDB</option><option value="postgresql" {source_selected('postgresql')}>PostgreSQL</option><option value="redis" {source_selected('redis')}>Redis</option></select>
-<div class="grid"><div><label>远程服务器 IP / 域名</label><input name="remote_host" required value="{self.esc(task['remote_host'])}">
-<label>SSH 端口</label><input name="remote_port" type="number" min="1" max="65535" required value="{task['remote_port']}">
-<label>SSH 用户名</label><input name="remote_user" required value="{self.esc(task['remote_user'])}">
-<label>SSH 登录方式</label><select id="auth-method" name="auth_method"><option value="key" {selected('key')}>SSH 私钥</option>
-<option value="password" {selected('password')}>SSH 密码</option></select>
-<div id="key-auth"><label>SSH 私钥路径</label><input name="ssh_key" value="{self.esc(task['ssh_key'])}">
-<small class="muted">使用私钥时填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small>
- </div><div id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password">
-<small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div></div>
-<div><div id="file-source"><label>远程文件或目录</label><input id="remote-path" name="remote_path" required value="{self.esc(task['remote_path'])}">
-<label>文件保存方式</label><select id="file-mode" name="file_mode"><option value="snapshot" {file_mode_selected('snapshot')}>快照压缩包</option><option value="incremental" {file_mode_selected('incremental')}>增量归档（只新增、不压缩）</option><option value="mirror" {file_mode_selected('mirror')}>完全镜像同步（不压缩）</option></select>
-<small class="muted">增量归档只添加新文件；完全镜像会同步新增、修改和删除。两种模式都使用一个固定目录。</small></div>
-<div id="database-source"><label>数据库地址</label><input name="database_host" value="{self.esc(task['database_host'])}"><small class="muted">这是相对于远程服务器的地址，数据库在同一台机器通常填 127.0.0.1。</small>
-<label>数据库端口</label><input name="database_port" type="number" min="0" max="65535" value="{task['database_port']}"><small class="muted">填 0 自动使用 MySQL 3306、PostgreSQL 5432 或 Redis 6379。</small>
-<label>数据库用户名</label><input id="database-user" name="database_user" maxlength="128" value="{self.esc(task['database_user'])}">
-<label>数据库名称</label><input id="database-name" name="database_name" maxlength="128" value="{self.esc(task['database_name'])}"><small class="muted">MySQL / PostgreSQL 必填；Redis 会备份整个实例，无需填写。</small>
-<label>数据库密码</label><input name="database_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">可留空用于免密连接；编辑时留空表示不修改。密码不会写入普通任务配置或命令行。</small></div>
-<label>本地备份目录</label><input name="backup_dir" required value="{self.esc(task['backup_dir'])}">
-<label>每隔几天备份</label><input name="interval_days" type="number" min="1" max="3650" step="1" required value="{task['interval_days']}">
-<label>在这些时间点备份</label><div id="schedule-times">{time_inputs}</div>
-<button type="button" class="secondary" id="add-time">＋ 添加时间</button>
-<input type="hidden" id="schedule-times-value" name="schedule_times">
-<small class="muted">例如每隔 1 天，设置 02:00 和 14:00，就是每天备份两次。</small>
-<div id="retention-settings"><label>最多保留多少份</label><input name="retention_limit" type="number" min="0" required value="{task['retention_limit']}">
-<small class="muted">填 0 表示全部保留，不自动删除。</small></div>
-<div id="file-threads"><label>并行线程数（1-16）</label><input name="transfer_threads" type="number" min="1" max="16" step="1" required value="{task['transfer_threads']}" oninput="if(+this.value>16)this.value=16;if(+this.value<1)this.value=1"></div></div></div>
-<p><label><input type="checkbox" name="enabled" {checked('enabled')}> 启用自动备份</label>
-<label><input type="checkbox" name="auto_install_dependencies" {checked('auto_install_dependencies')}> 首次连接自动安装对应备份客户端</label></p>
-<button>保存任务</button></form></section>
-{delete_task}<section class="card"><h2>已有备份</h2>{backup_rows or '<p class="muted">暂无备份</p>'}</section>"""
+        body = f"""<div class="page-heading"><div><span class="card-kicker">Task Setup</span><h1>{'编辑任务' if task_id else '新建备份任务'}</h1><p class="muted">按区域填写即可，隐藏的选项不会参与保存。</p></div><a class="btn secondary" href="/tasks">返回任务列表</a></div>
+<section class="card form-shell"><form method="post" action="/task/save"><input type="hidden" name="id" value="{task_id}">
+<div class="form-section"><div class="section-heading"><span class="section-icon">1</span><div><h2>基本信息</h2><p>给任务命名并选择要备份的数据类型。</p></div></div><div class="form-grid"><div><label>任务名称</label><input name="name" required maxlength="50" value="{self.esc(task['name'])}"></div><div><label>备份类型</label><select id="source-type" name="source_type"><option value="files" {source_selected('files')}>文件 / 目录</option><option value="mysql" {source_selected('mysql')}>MySQL / MariaDB</option><option value="postgresql" {source_selected('postgresql')}>PostgreSQL</option><option value="redis" {source_selected('redis')}>Redis</option></select></div></div></div>
+<div class="form-section"><div class="section-heading"><span class="section-icon">2</span><div><h2>远程服务器与认证</h2><p>程序通过 SSH 安全连接远程服务器。</p></div></div><div class="form-grid"><div><label>远程服务器 IP / 域名</label><input name="remote_host" required value="{self.esc(task['remote_host'])}"></div><div><label>SSH 端口</label><input name="remote_port" type="number" min="1" max="65535" required value="{task['remote_port']}"></div><div><label>SSH 用户名</label><input name="remote_user" required value="{self.esc(task['remote_user'])}"></div><div><label>SSH 登录方式</label><select id="auth-method" name="auth_method"><option value="key" {selected('key')}>SSH 私钥</option><option value="password" {selected('password')}>SSH 密码</option></select></div><div class="wide" id="key-auth"><label>SSH 私钥路径</label><input name="ssh_key" value="{self.esc(task['ssh_key'])}"><small class="muted">填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small></div><div class="wide" id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div></div></div>
+<div class="form-section"><div class="section-heading"><span class="section-icon">3</span><div><h2>备份来源</h2><p>只会显示当前备份类型需要的字段。</p></div></div><div id="file-source"><label>远程文件或目录</label><input id="remote-path" name="remote_path" required value="{self.esc(task['remote_path'])}"><label>文件保存方式</label><select id="file-mode" name="file_mode"><option value="snapshot" {file_mode_selected('snapshot')}>快照压缩包</option><option value="incremental" {file_mode_selected('incremental')}>增量归档（只新增、不压缩）</option><option value="mirror" {file_mode_selected('mirror')}>完全镜像同步（不压缩）</option></select><small class="muted">增量归档只添加新文件；完全镜像会同步新增、修改和删除。两种模式都使用一个固定目录。</small></div><div id="database-source" class="form-grid"><div><label>数据库地址</label><input name="database_host" value="{self.esc(task['database_host'])}"><small class="muted">数据库在同一台远程服务器通常填 127.0.0.1。</small></div><div><label>数据库端口</label><input name="database_port" type="number" min="0" max="65535" value="{task['database_port']}"><small class="muted">填 0 自动使用默认端口。</small></div><div><label>数据库用户名</label><input id="database-user" name="database_user" maxlength="128" value="{self.esc(task['database_user'])}"></div><div><label>数据库名称</label><input id="database-name" name="database_name" maxlength="128" value="{self.esc(task['database_name'])}"><small class="muted">MySQL / PostgreSQL 必填；Redis 无需填写。</small></div><div class="wide"><label>数据库密码</label><input name="database_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">可留空用于免密连接；编辑时留空表示不修改。密码不会写入普通任务配置或命令行。</small></div></div></div>
+<div class="form-section"><div class="section-heading"><span class="section-icon">4</span><div><h2>存储与传输</h2><p>设置保存位置、保留策略与文件传输并发。</p></div></div><label>本地备份目录</label><input name="backup_dir" required value="{self.esc(task['backup_dir'])}"><div class="form-grid"><div id="retention-settings"><label>最多保留多少份</label><input name="retention_limit" type="number" min="0" required value="{task['retention_limit']}"><small class="muted">填 0 表示全部保留。</small></div><div id="file-threads"><label>并行线程数（1-16）</label><input name="transfer_threads" type="number" min="1" max="16" step="1" required value="{task['transfer_threads']}" oninput="if(+this.value>16)this.value=16;if(+this.value<1)this.value=1"><small class="muted">小文件较多时可适当提高。</small></div></div></div>
+<div class="form-section"><div class="section-heading"><span class="section-icon">5</span><div><h2>自动执行计划</h2><p>备份周期和一天内的时间点可以分别设置。</p></div></div><div class="form-grid"><div><label>每隔几天备份</label><input name="interval_days" type="number" min="1" max="3650" step="1" required value="{task['interval_days']}"></div><div><label>在这些时间点备份</label><div id="schedule-times">{time_inputs}</div><button type="button" class="secondary" id="add-time">＋ 添加时间</button><input type="hidden" id="schedule-times-value" name="schedule_times"><small class="muted">例如每隔 1 天，设置 02:00 和 14:00，就是每天备份两次。</small></div></div></div>
+<div class="form-section"><div class="section-heading"><span class="section-icon">6</span><div><h2>自动化选项</h2><p>这些选项可以随时回来修改。</p></div></div><div class="check-row"><label><input type="checkbox" name="enabled" {checked('enabled')}> 启用自动备份</label><label><input type="checkbox" name="auto_install_dependencies" {checked('auto_install_dependencies')}> 首次连接自动安装对应备份客户端</label></div></div>
+<div class="form-actions"><a class="btn secondary" href="/tasks">取消</a><button data-loading="正在保存…">保存任务</button></div></form></section>
+{delete_task}<section class="card form-shell"><div class="card-heading"><div><span class="card-kicker">Archives</span><h2>已有备份</h2></div><span class="badge waiting">{len(backups)} 项</span></div>{backup_rows or '<p class="muted">暂无备份</p>'}</section>"""
         return self.page("任务设置", body, token)
 
     def settings_html(self, token):
-        body = f"""<section class="card"><h1>面板与通知设置</h1><form method="post" action="/settings">
-<label>面板用户名</label><input name="admin_username" required value="{self.esc(self.config['admin_username'])}">
-<label>新密码</label><input name="password" type="password" minlength="10" maxlength="256" autocomplete="new-password">
-<small class="muted">不修改请留空；新密码至少 10 位。</small>
-<label>Telegram Bot Token</label><input name="telegram_bot_token" value="{self.esc(self.config.get('telegram_bot_token', ''))}">
-<label>Telegram Chat ID</label><input name="telegram_chat_id" value="{self.esc(self.config.get('telegram_chat_id', ''))}">
-<p class="row"><button>保存设置</button><button class="secondary" formaction="/telegram/test">发送 Telegram 测试消息</button></p></form></section>"""
+        body = f"""<div class="page-heading"><div><span class="card-kicker">Preferences</span><h1>面板与通知设置</h1><p class="muted">管理登录凭据和 Telegram 通知，保存后立即生效。</p></div></div>
+<form method="post" action="/settings" class="settings-form"><div class="settings-grid">
+<section class="card form-shell"><div class="card-heading"><div><span class="card-kicker">Account</span><h2>面板账户</h2></div><span class="badge success"><span class="status-dot"></span>安全会话</span></div>
+<div class="form-section compact"><div class="section-heading"><span class="section-icon">A</span><div><h2>登录身份</h2><p>修改用户名或密码后，当前登录会自动退出。</p></div></div>
+<label>面板用户名</label><input name="admin_username" required maxlength="64" autocomplete="username" value="{self.esc(self.config['admin_username'])}">
+<label>新密码</label><input name="password" type="password" minlength="10" maxlength="256" autocomplete="new-password" placeholder="不修改请留空">
+<small class="muted">新密码至少 10 位，建议使用密码管理器生成随机密码。</small></div></section>
+<section class="card form-shell"><div class="card-heading"><div><span class="card-kicker">Notifications</span><h2>Telegram 通知</h2></div><span class="badge waiting">可选</span></div>
+<div class="form-section compact"><div class="section-heading"><span class="section-icon">T</span><div><h2>机器人连接</h2><p>用于推送备份状态，也可通过机器人管理任务。</p></div></div>
+<label>Telegram Bot Token</label><input name="telegram_bot_token" autocomplete="off" spellcheck="false" value="{self.esc(self.config.get('telegram_bot_token', ''))}" placeholder="例如 123456:ABC...">
+<label>Telegram Chat ID</label><input name="telegram_chat_id" autocomplete="off" spellcheck="false" value="{self.esc(self.config.get('telegram_chat_id', ''))}" placeholder="个人或群组 Chat ID">
+<small class="muted">建议先保存，再发送测试消息确认机器人和 Chat ID 均可用。</small>
+<div class="form-actions inner"><button class="secondary" formaction="/telegram/test" data-loading="正在发送…">发送测试消息</button></div></div></section></div>
+<div class="form-actions settings-actions"><a class="btn secondary" href="/">取消</a><button data-loading="正在保存…">保存全部设置</button></div></form>"""
         return self.page("设置", body, token)
 
     @staticmethod
     def login_html(error=""):
-        alert = f"<p class='bad'>{html.escape(error)}</p>" if error else ""
+        alert = f"<div class='login-alert' role='alert'><span>!</span><p>{html.escape(error)}</p></div>" if error else ""
         return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 - Simple Backup</title>
 <script>document.documentElement.dataset.theme=localStorage.getItem('sb_theme')||'auto'</script><style>
-:root{{--bg:#eef3f9;--fg:#182230;--card:#fff;--border:#b9c5d4;--input:#fff}}
-html[data-theme=dark]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#43536a;--input:#111c2d}}
-@media(prefers-color-scheme:dark){{html[data-theme=auto]{{--bg:#0f1724;--fg:#e6edf7;--card:#172235;--border:#43536a;--input:#111c2d}}}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);font:15px system-ui;color:var(--fg);display:grid;place-items:center;min-height:100vh}}
-.login{{width:min(390px,calc(100% - 28px));background:var(--card);padding:30px;border-radius:14px;box-shadow:0 12px 36px #17243b24}}
-input{{width:100%;padding:12px;margin:6px 0 16px;border:1px solid var(--border);border-radius:8px;background:var(--input);color:var(--fg)}}button{{width:100%;padding:12px;border:0;border-radius:8px;background:#1769aa;color:white}}
-.theme{{position:fixed;right:16px;top:16px;width:auto;padding:7px;background:transparent;color:var(--fg);font-size:22px;transition:transform .18s}}.theme.changed{{transform:rotate(25deg) scale(1.15)}}.bad{{color:#e04444}}</style></head><body>
-<button type="button" class="theme" id="theme" aria-label="切换主题" title="切换主题">◐</button><form class="login" method="post" action="/login">
-<h1>Simple Backup</h1><p>登录备份管理面板</p>{alert}<label>用户名</label>
-<input name="username" required autofocus autocomplete="username"><label>密码</label>
-<input name="password" type="password" required maxlength="256" autocomplete="current-password"><button>登录</button>
-</form><script>const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}},ti={{auto:'◐',light:'☀',dark:'☾'}};
+:root{{--bg:#f4f7fc;--bg-soft:#e8efff;--fg:#162033;--muted:#68758a;--card:#ffffffed;--border:#dce4f0;--input:#fff;--primary:#356df3;--primary-hover:#285dd8;--primary-soft:#eaf0ff;--success:#15805d;--success-soft:#e6f7f1;--danger:#cf3f4f;--danger-soft:#fff0f2;--shadow:0 28px 80px #21365c20;--ring:#356df333}}
+html[data-theme=dark]{{--bg:#0b1320;--bg-soft:#11203a;--fg:#edf3ff;--muted:#9baac0;--card:#131f32ed;--border:#2a3952;--input:#0e1929;--primary:#7198ff;--primary-hover:#8aaaff;--primary-soft:#1b315f;--success:#4bcca0;--success-soft:#153a35;--danger:#ff7585;--danger-soft:#411e29;--shadow:0 30px 90px #0009;--ring:#7fa1ff44}}
+@media(prefers-color-scheme:dark){{html[data-theme=auto]{{--bg:#0b1320;--bg-soft:#11203a;--fg:#edf3ff;--muted:#9baac0;--card:#131f32ed;--border:#2a3952;--input:#0e1929;--primary:#7198ff;--primary-hover:#8aaaff;--primary-soft:#1b315f;--success:#4bcca0;--success-soft:#153a35;--danger:#ff7585;--danger-soft:#411e29;--shadow:0 30px 90px #0009;--ring:#7fa1ff44}}}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;background:radial-gradient(circle at 12% 8%,var(--bg-soft),transparent 34rem),radial-gradient(circle at 90% 90%,var(--primary-soft),transparent 30rem),var(--bg);color:var(--fg);font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;-webkit-font-smoothing:antialiased;display:grid;place-items:center;padding:42px 22px;overflow-x:hidden}}
+body:before,body:after{{content:'';position:fixed;border-radius:999px;filter:blur(1px);pointer-events:none;opacity:.48;animation:float 9s ease-in-out infinite}}body:before{{width:270px;height:270px;left:-90px;top:-80px;background:linear-gradient(135deg,#6f91ff44,#8f70ff18)}}body:after{{width:220px;height:220px;right:-70px;bottom:-60px;background:linear-gradient(135deg,#53d8be35,#5e83ff22);animation-delay:-4s}}
+.login-layout{{position:relative;z-index:1;width:min(960px,100%);display:grid;grid-template-columns:minmax(0,1.05fr) minmax(360px,.8fr);overflow:hidden;background:var(--card);border:1px solid var(--border);border-radius:26px;box-shadow:var(--shadow);backdrop-filter:blur(22px);animation:rise .55s cubic-bezier(.2,.8,.2,1) both}}
+.brand-panel{{padding:54px;background:linear-gradient(145deg,#13284e 0%,#1c3975 54%,#315ec2 100%);color:white;position:relative;overflow:hidden}}.brand-panel:after{{content:'';position:absolute;width:300px;height:300px;border:1px solid #ffffff28;border-radius:50%;right:-170px;top:-120px;box-shadow:0 0 0 58px #ffffff0a,0 0 0 116px #ffffff08}}
+.brand-mark{{width:52px;height:52px;display:grid;place-items:center;border-radius:16px;background:#ffffff17;border:1px solid #ffffff2e;box-shadow:inset 0 1px #ffffff3b;font-size:25px;margin-bottom:32px}}.eyebrow{{font-size:12px;font-weight:800;letter-spacing:.15em;text-transform:uppercase;color:#bcd0ff}}.brand-panel h1{{font-size:clamp(32px,5vw,48px);line-height:1.04;letter-spacing:-.045em;margin:10px 0 18px;max-width:430px}}.brand-panel>p{{color:#d9e4ff;max-width:440px;font-size:16px}}
+.security-list{{display:grid;gap:12px;margin-top:38px;position:relative;z-index:1}}.security-item{{display:flex;align-items:flex-start;gap:11px;color:#e9efff}}.security-icon{{width:25px;height:25px;flex:0 0 25px;display:grid;place-items:center;border-radius:8px;background:#ffffff15;border:1px solid #ffffff24;font-size:12px;font-weight:800}}.security-item b{{display:block;font-size:13px}}.security-item small{{display:block;color:#bfcff2;margin-top:1px}}
+.login-panel{{padding:48px 44px;display:flex;flex-direction:column;justify-content:center;min-width:0}}.login-panel h2{{font-size:27px;letter-spacing:-.025em;margin:0 0 6px}}.login-panel>.muted{{color:var(--muted);margin:0 0 26px}}label{{display:block;font-weight:700;margin:15px 0 7px}}input{{width:100%;padding:13px 14px;border:1px solid var(--border);border-radius:11px;background:var(--input);color:var(--fg);font:inherit;outline:0;transition:border-color .18s,box-shadow .18s,transform .18s}}input:hover{{border-color:#a9b8cf}}input:focus{{border-color:var(--primary);box-shadow:0 0 0 4px var(--ring);transform:translateY(-1px)}}
+.login-submit{{width:100%;min-height:48px;margin-top:24px;border:0;border-radius:11px;background:linear-gradient(135deg,var(--primary),#5c78f4);color:white;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 10px 24px #356df331;transition:transform .18s,box-shadow .18s,filter .18s;position:relative}}.login-submit:hover{{transform:translateY(-2px);box-shadow:0 14px 30px #356df342;filter:saturate(1.12)}}.login-submit:active{{transform:translateY(0)}}.login-submit:disabled{{cursor:wait;opacity:.78}}.login-submit.is-loading{{color:transparent}}.login-submit.is-loading:after{{content:'';position:absolute;inset:0;margin:auto;width:19px;height:19px;border:2px solid #ffffff70;border-top-color:white;border-radius:50%;animation:spin .7s linear infinite}}
+.login-alert{{display:flex;gap:10px;align-items:center;background:var(--danger-soft);color:var(--danger);border:1px solid currentColor;border-radius:11px;padding:10px 12px;margin:16px 0}}.login-alert span{{width:22px;height:22px;display:grid;place-items:center;border-radius:50%;background:currentColor;color:white;font-weight:800}}.login-alert p{{margin:0;font-size:13px;font-weight:650}}.transport{{display:flex;gap:7px;align-items:center;margin-top:20px;color:var(--muted);font-size:12px}}.transport-dot{{width:8px;height:8px;border-radius:50%;background:var(--success);box-shadow:0 0 0 4px var(--success-soft)}}.transport.insecure{{color:var(--danger)}}.transport.insecure .transport-dot{{background:var(--danger);box-shadow:0 0 0 4px var(--danger-soft)}}
+.theme{{position:fixed;z-index:4;right:18px;top:18px;width:42px;height:42px;display:grid;place-items:center;border:1px solid var(--border);border-radius:13px;background:var(--card);color:var(--fg);font-size:21px;cursor:pointer;box-shadow:0 10px 28px #17243b18;backdrop-filter:blur(14px);transition:transform .18s,border-color .18s,background .18s}}.theme:hover{{transform:translateY(-2px);border-color:var(--primary)}}.theme.changed{{transform:rotate(25deg) scale(1.13)}}
+@keyframes rise{{from{{opacity:0;transform:translateY(18px) scale(.985)}}to{{opacity:1;transform:none}}}}@keyframes float{{50%{{transform:translateY(18px) rotate(5deg)}}}}@keyframes spin{{to{{transform:rotate(360deg)}}}}
+@media(max-width:760px){{body{{padding:76px 14px 22px}}.login-layout{{grid-template-columns:1fr;border-radius:20px}}.brand-panel{{padding:28px 25px}}.brand-mark{{margin-bottom:18px}}.brand-panel h1{{font-size:31px;margin-bottom:11px}}.brand-panel>p{{font-size:14px}}.security-list{{display:none}}.login-panel{{padding:30px 25px 34px}}}}
+@media(max-width:420px){{.brand-panel{{padding:24px 21px}}.login-panel{{padding:27px 21px 30px}}.theme{{right:12px;top:12px}}}}
+@media(prefers-reduced-motion:reduce){{*,*:before,*:after{{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}}}</style></head><body>
+<button type="button" class="theme" id="theme" aria-label="切换主题" title="切换主题">◐</button><main class="login-layout">
+<section class="brand-panel"><div class="brand-mark" aria-hidden="true">↗</div><span class="eyebrow">Simple Backup</span><h1>你的服务器备份控制中心</h1><p>集中管理跨服务器文件与数据库备份，随时掌握任务进度和存储状态。</p>
+<div class="security-list"><div class="security-item"><span class="security-icon">TLS</span><div><b>HTTPS 安全会话</b><small>浏览器与面板之间的敏感数据使用加密通道传输</small></div></div><div class="security-item"><span class="security-icon">5×</span><div><b>登录失败限速</b><small>单个来源 15 分钟内最多尝试 5 次，并设有全局限制</small></div></div><div class="security-item"><span class="security-icon">CK</span><div><b>安全 Cookie</b><small>Secure、HttpOnly、SameSite=Strict，降低会话泄漏风险</small></div></div><div class="security-item"><span class="security-icon">CS</span><div><b>CSRF 防护</b><small>登录后的每个写操作都需要独立请求令牌</small></div></div></div></section>
+<form class="login-panel" id="login-form" method="post" action="/login"><h2>欢迎回来</h2><p class="muted">登录后管理你的备份任务</p>{alert}<label for="username">用户名</label>
+<input id="username" name="username" required autofocus maxlength="64" autocomplete="username" placeholder="请输入面板用户名"><label for="password">密码</label>
+<input id="password" name="password" type="password" required maxlength="256" autocomplete="current-password" placeholder="请输入面板密码"><button class="login-submit" id="login-submit" data-loading="正在验证…">登录面板</button>
+<div class="transport" id="transport-status"><span class="transport-dot"></span><span>正在检查连接安全性…</span></div></form></main><script>const tb=document.getElementById('theme'),tn={{auto:'自动',light:'日间',dark:'夜间'}},ti={{auto:'◐',light:'☀',dark:'☾'}};
 function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);tb.textContent=ti[t];tb.title='主题：'+tn[t];tb.setAttribute('aria-label',tb.title);if(feedback){{tb.classList.remove('changed');void tb.offsetWidth;tb.classList.add('changed');setTimeout(()=>tb.classList.remove('changed'),220)}}}}
-tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);</script></body></html>"""
+tb.onclick=()=>{{let t=document.documentElement.dataset.theme;ts(t==='auto'?'light':t==='light'?'dark':'auto',true)}};ts(document.documentElement.dataset.theme);
+const transport=document.getElementById('transport-status'),transportText=transport.querySelector('span:last-child');if(location.protocol==='https:'){{transportText.textContent='当前连接已通过 HTTPS 加密'}}else{{transport.classList.add('insecure');transportText.textContent='当前为 HTTP，请通过 HTTPS 或反向代理访问'}}
+document.getElementById('login-form').addEventListener('submit',()=>{{let button=document.getElementById('login-submit');button.classList.add('is-loading');button.disabled=true;button.setAttribute('aria-busy','true')}});</script></body></html>"""
 
     def save_task_form(self, form):
         task_id = form.get("id", "")
@@ -1609,6 +1651,31 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         self.end_headers()
 
+    @staticmethod
+    def safe_return_to(form, fallback='/'):
+        target = form.get('return_to', '').strip()
+        parsed = urllib.parse.urlsplit(target)
+        if (
+            target.startswith('/')
+            and not target.startswith('//')
+            and not parsed.scheme
+            and not parsed.netloc
+        ):
+            return target
+        return fallback
+
+    def redirect_notice(self, form, message, fallback='/', tone='success', target=None):
+        destination = target or self.safe_return_to(form, fallback)
+        parsed = urllib.parse.urlsplit(destination)
+        query = [
+            (name, value)
+            for name, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if name not in ('notice', 'tone')
+        ]
+        query.extend((('notice', message), ('tone', tone)))
+        location = urllib.parse.urlunsplit(('', '', parsed.path, urllib.parse.urlencode(query), parsed.fragment))
+        self.redirect(location)
+
     def form(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1703,6 +1770,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(self.app.page("未找到", "<section class='card'><h1>页面不存在</h1></section>", token), 404)
 
     def do_POST(self):
+        form = {}
         try:
             form = self.form()
             if self.path == "/login":
@@ -1716,8 +1784,11 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_action(form)
         except (ValueError, OSError) as exc:
             self.app.log(f"网页操作失败 {self.path}：{exc}", "ERROR")
-            token = self.session_token()
-            self.send_html(self.app.page("操作失败", f"<section class='card'><h1>操作失败</h1><p class='bad'>{html.escape(str(exc))}</p></section>", token), 400)
+            if self.authenticated():
+                self.redirect_notice(form, str(exc), '/tasks', 'error')
+            else:
+                token = self.session_token()
+                self.send_html(self.app.page("操作失败", f"<section class='card'><h1>操作失败</h1><p class='bad'>{html.escape(str(exc))}</p></section>", token), 400)
 
     def handle_login(self, form):
         address = self.client_address[0]
@@ -1754,7 +1825,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path == "/task/save":
             task = self.app.save_task_form(form)
-            self.redirect(f"/task?id={task['id']}")
+            self.redirect_notice(form, '任务设置已保存', target=f"/task?id={task['id']}")
         elif path == "/task/delete":
             task = self.app.task(form.get("id", ""))
             if not task:
@@ -1767,7 +1838,7 @@ class Handler(BaseHTTPRequestHandler):
             self.app.set_task_secret(task["id"], "database_password", "")
             self.app._save_config()
             self.app._save_state()
-            self.redirect("/")
+            self.redirect_notice(form, '任务已删除，已有备份文件未受影响', target='/tasks')
         elif path == "/backup/start":
             task_id = form.get("id", "")
             task = self.app.task(task_id)
@@ -1776,14 +1847,14 @@ class Handler(BaseHTTPRequestHandler):
             ok, message = self.app.start_backup(task_id, source)
             if not ok:
                 raise ValueError(message)
-            self.redirect("/tasks")
+            self.redirect_notice(form, message, '/tasks')
         elif path in ("/backup/pause", "/backup/stop"):
             ok, message = self.app.stop_backup(
                 form.get("id", ""), path == "/backup/stop", "网页"
             )
             if not ok:
                 raise ValueError(message)
-            self.redirect("/tasks")
+            self.redirect_notice(form, message, '/tasks')
         elif path == "/backup/delete":
             task = self.app.task(form.get("id", ""))
             allowed = {p.name: p for p in self.app.backups(task)} if task else {}
@@ -1792,7 +1863,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("备份不存在")
             self.app.delete_backup(target)
             self.app.notify(f"已删除备份：{task['name']} / {target.name}", task["id"])
-            self.redirect(f"/task?id={task['id']}")
+            self.redirect_notice(form, f'已删除备份：{target.name}', f"/task?id={task['id']}")
         elif path == "/settings":
             username = form.get("admin_username", "").strip()
             if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,50}", username):
@@ -1809,7 +1880,7 @@ class Handler(BaseHTTPRequestHandler):
             if changed:
                 self.redirect("/login", "sb_session=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
             else:
-                self.redirect("/settings")
+                self.redirect_notice(form, '面板与通知设置已保存', '/settings')
         elif path == "/telegram/test":
             token = form.get("telegram_bot_token", "").strip()
             chat_id = form.get("telegram_chat_id", "").strip()
@@ -1820,11 +1891,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.log(f"Telegram 测试失败：{error}", "ERROR")
                 raise ValueError("Telegram 测试失败：" + error)
             self.app.log("Telegram 测试消息发送成功")
-            self.send_html(self.app.page(
-                "测试成功",
-                "<section class='card'><h1>Telegram 测试成功</h1><p>请检查机器人发来的测试消息。</p><a class='btn' href='/settings'>返回设置</a></section>",
-                self.session_token(),
-            ))
+            self.redirect_notice(form, 'Telegram 测试消息已发送，请检查机器人会话', '/settings')
         else:
             raise ValueError("未知操作")
 

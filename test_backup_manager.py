@@ -379,6 +379,49 @@ class BackupManagerTest(unittest.TestCase):
         self.assertIn(("Connection", "close"), response.headers)
         self.assertTrue(response.close_connection)
 
+    def test_frontend_feedback_security_and_safe_return(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = BackupApp(root / "data")
+            task = sample_task(root / "backups")
+            app.config["tasks"] = [task]
+            token = app.sign_session("panel-user")
+
+            home = app.home_html(token)
+            for marker in (
+                "toast-stack", "notice", "tone", "confirm-dialog", "is-loading",
+                "prefers-reduced-motion", "badge", "running", "success", "failed",
+                "@media(max-width:640px)",
+            ):
+                self.assertIn(marker, home)
+
+            settings = app.settings_html(token)
+            self.assertIn("settings-grid", settings)
+            self.assertIn('data-loading="正在保存…"', settings)
+            self.assertIn('data-loading="正在发送…"', settings)
+            self.assertIn("/telegram/test", settings)
+
+            login = app.login_html()
+            for marker in (
+                "HttpOnly", "SameSite=Strict", "登录失败限速", "CSRF 防护",
+                "prefers-reduced-motion", "正在验证", "HTTPS",
+            ):
+                self.assertIn(marker, login)
+
+            self.assertEqual(Handler.safe_return_to({"return_to": "/tasks"}), "/tasks")
+            self.assertEqual(
+                Handler.safe_return_to({"return_to": "/task?id=abc"}), "/task?id=abc"
+            )
+            self.assertEqual(
+                Handler.safe_return_to({"return_to": "https://evil.example"}, "/fallback"),
+                "/fallback",
+            )
+            self.assertEqual(
+                Handler.safe_return_to({"return_to": "//evil.example"}, "/fallback"),
+                "/fallback",
+            )
+            self.assertEqual(Handler.safe_return_to({}, "/fallback"), "/fallback")
+
     def test_installer_does_not_overwrite_panel_port(self):
         script = Path("install.sh").read_text(encoding="utf-8")
         self.assertIn('firewall_port=$1', script)
