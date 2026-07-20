@@ -326,7 +326,8 @@ class BackupManagerTest(unittest.TestCase):
             detail = app.task_detail_html(progress_task, app.sign_session("panel-user"))
             self.assertIn("活跃传输槽位", detail)
             self.assertIn("该任务的全部日志", detail)
-            self.assertIn("☀", detail)
+            self.assertIn("theme-switch", detail)
+            self.assertIn('data-theme-value="light"', detail)
 
     def test_pause_discard_and_restart_resume(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -391,9 +392,21 @@ class BackupManagerTest(unittest.TestCase):
             for marker in (
                 "toast-stack", "notice", "tone", "confirm-dialog", "is-loading",
                 "prefers-reduced-motion", "badge", "running", "success", "failed",
-                "@media(max-width:640px)",
+                "@media(max-width:640px)", 'rel="icon"', "brand-icon",
+                "theme-switch", "theme-option", "--header-fg",
             ):
                 self.assertIn(marker, home)
+
+            backup_dir = Path(task["backup_dir"])
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            long_name = "20260720-120000_" + ("very-long-backup-name-" * 7) + "_" + backup_prefix(task) + ".tar.zst"
+            (backup_dir / long_name).write_bytes(b"backup")
+            task_form = app.task_form_html(task, token)
+            for marker in (
+                "backup-list", "backup-file", "file-name", "overflow-wrap:anywhere",
+                "danger-zone", "danger-outline", "删除文件", long_name,
+            ):
+                self.assertIn(marker, task_form)
 
             settings = app.settings_html(token)
             self.assertIn("settings-grid", settings)
@@ -404,7 +417,8 @@ class BackupManagerTest(unittest.TestCase):
             login = app.login_html()
             for marker in (
                 "HttpOnly", "SameSite=Strict", "登录失败限速", "CSRF 防护",
-                "prefers-reduced-motion", "正在验证", "HTTPS",
+                "prefers-reduced-motion", "正在验证", "HTTPS", 'rel="icon"',
+                "brand-mark", "login-theme-switch", 'data-theme-value="dark"',
             ):
                 self.assertIn(marker, login)
 
