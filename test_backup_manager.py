@@ -270,6 +270,21 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("--partial", calls[1])
             self.assertIn("-J root@jump.example.com:22", calls[1][calls[1].index("-e") + 1])
             self.assertIn("root@dr.example.com:/srv/offsite/", calls[1])
+            attempts = []
+            def flaky_upload(_task, _path, _job):
+                attempts.append(1)
+                if len(attempts) < 3:
+                    raise RuntimeError("temporary network failure")
+            retry_job = {"phase": ""}
+            app.upload_offsite = flaky_upload
+            app.upload_offsite_with_retry(database_task, archive, retry_job, delay=0)
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(retry_job["offsite_failures"], 0)
+            attempts.clear()
+            app.upload_offsite = lambda *_args: attempts.append(1) or (_ for _ in ()).throw(RuntimeError("down"))
+            with self.assertRaises(RuntimeError):
+                app.upload_offsite_with_retry(database_task, archive, {"phase": ""}, delay=0)
+            self.assertEqual(len(attempts), 11)
             all_archive = Path(database_task["backup_dir"]) / f"20260724-120000_{backup_prefix(database_task)}.tar.zst"
             all_archive.write_bytes(b"all")
             uploaded = []

@@ -1020,6 +1020,32 @@ class BackupApp:
         self._save_state()
         self.notify(f"容灾上传成功：{task['name']}\n文件名：{backup_path.name}\n目标：{remote_path}", task["id"])
 
+    def upload_offsite_with_retry(self, task, backup_path, job, delay=30, max_failures=10):
+        failures = 0
+        while True:
+            try:
+                self.upload_offsite(task, backup_path, job)
+                job["offsite_failures"] = 0
+                return
+            except Exception as exc:
+                failures += 1
+                job["offsite_failures"] = failures
+                error = str(exc)
+                self.state["offsite"] = {
+                    "last_result": "重试中" if failures <= max_failures else "失败",
+                    "last_backup": backup_path.name,
+                    "last_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+                    "last_error": f"连续失败 {failures} 次：{error}",
+                }
+                self._save_state()
+                if failures > max_failures:
+                    raise RuntimeError(f"容灾上传连续失败超过 {max_failures} 次：{error}") from exc
+                self.log(f"容灾上传失败，将在 {delay} 秒后重试（{failures}/{max_failures}）：{backup_path.name}：{error}", "ERROR", task["id"])
+                if delay and job.get("stop") and job["stop"].wait(delay):
+                    raise RuntimeError("容灾上传已停止")
+                if delay and not job.get("stop"):
+                    time.sleep(delay)
+
     def start_offsite_upload_all(self):
         if not self.config.get("offsite_enabled"):
             return False, "请先启用并保存容灾上传设置"
@@ -1045,10 +1071,11 @@ class BackupApp:
             self.notify(f"容灾上传开始：共 {len(items)} 个已有备份")
             for index, (task, path) in enumerate(items, 1):
                 try:
-                    self.upload_offsite(task, path, job)
+                    self.upload_offsite_with_retry(task, path, job)
                 except Exception as exc:
                     failures.append(f"{task['name']} / {path.name}: {exc}")
                     self.log(f"容灾上传失败：{failures[-1]}", "ERROR", task["id"])
+                    break
                 job["progress"] = int(index * 100 / len(items))
                 self.state["offsite"].update(last_backup=f"{index}/{len(items)}", last_time=f"{datetime.now():%Y-%m-%d %H:%M:%S}")
                 self._save_state()
@@ -1216,7 +1243,7 @@ class BackupApp:
                         task["id"],
                     )
                     try:
-                        self.upload_offsite(task, final, job)
+                        self.upload_offsite_with_retry(task, final, job)
                     except Exception as exc:
                         error = str(exc)
                         self.state["offsite"] = {
