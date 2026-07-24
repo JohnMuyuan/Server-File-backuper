@@ -45,6 +45,13 @@ DEFAULTS = {
     "tls_cert": "/var/lib/simple-backup/server.crt",
     "tls_key": "/var/lib/simple-backup/server.key",
     "session_secret": "",
+    "offsite_enabled": False,
+    "offsite_host": "",
+    "offsite_port": 22,
+    "offsite_user": "root",
+    "offsite_auth_method": "key",
+    "offsite_ssh_key": "/root/.ssh/id_ed25519",
+    "offsite_remote_path": "/var/backups/simple-backup-offsite",
 }
 TASK_DEFAULTS = {
     "id": "", "name": "新备份任务", "remote_host": "", "remote_port": 22,
@@ -322,6 +329,7 @@ class BackupApp:
         self.state = self._read_json(self.state_path, {"tasks": {}, "telegram_offset": 0, "low_disks": {}})
         self.state.setdefault("tasks", {})
         self.state.setdefault("low_disks", {})
+        self.state.setdefault("offsite", {})
         self.jobs = {}
         self.login_failures = {}
         self.account_failures = []
@@ -384,6 +392,12 @@ class BackupApp:
 
     def task_database_password(self, task_id):
         return self._read_json(self.secret_path(task_id), {}).get("database_password", "")
+
+    def offsite_password(self):
+        return self._read_json(self.secret_path("offsite"), {}).get("ssh_password", "")
+
+    def set_offsite_password(self, password):
+        self.set_task_secret("offsite", "ssh_password", password)
 
     def set_task_secret(self, task_id, key, value):
         path = self.secret_path(task_id)
@@ -505,6 +519,14 @@ class BackupApp:
     def ssh_program(self, task):
         prefix = ["sshpass", "-e", "ssh"] if task["auth_method"] == "password" else ["ssh"]
         return prefix, " ".join(shlex.quote(item) for item in [*prefix, *self.ssh_options(task)])
+
+    def offsite_task(self, task):
+        return {
+            "id": task["id"], "backup_dir": task["backup_dir"],
+            "auth_method": self.config["offsite_auth_method"],
+            "remote_port": self.config["offsite_port"],
+            "ssh_key": self.config["offsite_ssh_key"],
+        }
 
     def remote_setup(self, task, job):
         state = self.task_state(task["id"])
@@ -891,11 +913,11 @@ class BackupApp:
                 daemon=True,
             ).start()
 
-    def execute(self, command, task, job, stdin=None, monitor_path=None, complete_progress=True):
+    def execute(self, command, task, job, stdin=None, monitor_path=None, complete_progress=True, password=None):
         environment = None
         if task["auth_method"] == "password":
             environment = os.environ.copy()
-            environment["SSHPASS"] = self.task_password(task["id"])
+            environment["SSHPASS"] = password if password is not None else self.task_password(task["id"])
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
@@ -951,6 +973,41 @@ class BackupApp:
         if errors:
             detail += "\n" + "".join(errors[-20:])
         return process.returncode, detail[-12000:]
+
+    def upload_offsite(self, task, backup_path, job):
+        if not self.config.get("offsite_enabled"):
+            return
+        remote_path = self.config["offsite_remote_path"].rstrip("/") or "/"
+        upload_task = self.offsite_task(task)
+        password = self.offsite_password() if upload_task["auth_method"] == "password" else None
+        if upload_task["auth_method"] == "key" and upload_task["ssh_key"] and not Path(upload_task["ssh_key"]).is_file():
+            raise RuntimeError(f"容灾 SSH 密钥不存在：{upload_task['ssh_key']}")
+        if upload_task["auth_method"] == "password" and not password:
+            raise RuntimeError("容灾服务器尚未保存 SSH 密码")
+        job.update(phase="正在上传容灾副本")
+        prefix, _ = self.ssh_program(upload_task)
+        remote = f"{self.config['offsite_user']}@{self.config['offsite_host']}"
+        code, output = self.execute(
+            [*prefix, *self.ssh_options(upload_task), remote, f"mkdir -p -- {shlex.quote(remote_path)}"],
+            upload_task, job, password=password,
+        )
+        if code:
+            raise RuntimeError(command_error(output, code))
+        _, ssh = self.ssh_program(upload_task)
+        source = str(backup_path) + ("/" if backup_path.is_dir() else "")
+        destination = f"{remote}:{remote_path}/{backup_path.name + '/' if backup_path.is_dir() else ''}"
+        code, output = self.execute(
+            ["rsync", "-a", "--partial", "--protect-args", "-e", ssh, source, destination],
+            upload_task, job, password=password,
+        )
+        if code:
+            raise RuntimeError(command_error(output, code))
+        self.state["offsite"] = {
+            "last_result": "成功", "last_backup": backup_path.name,
+            "last_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "last_error": "",
+        }
+        self._save_state()
+        self.notify(f"容灾上传成功：{task['name']}\n文件名：{backup_path.name}\n目标：{remote_path}", task["id"])
 
     def backups(self, task):
         root = Path(task["backup_dir"])
@@ -1104,6 +1161,16 @@ class BackupApp:
                         f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n剩余容量：{human_size(free)}",
                         task["id"],
                     )
+                    try:
+                        self.upload_offsite(task, final, job)
+                    except Exception as exc:
+                        error = str(exc)
+                        self.state["offsite"] = {
+                            "last_result": "失败", "last_backup": final.name,
+                            "last_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "last_error": error,
+                        }
+                        self._save_state()
+                        self.notify(f"容灾上传失败：{task['name']}\n文件名：{final.name}\n原因：{error}", task["id"])
                     return
                 except Exception as exc:
                     error = str(exc)
@@ -1304,16 +1371,16 @@ pre{{padding:16px;border-radius:12px;max-height:520px;box-shadow:inset 0 1px 7px
 dialog{{width:min(430px,calc(100% - 28px));padding:0;border:1px solid var(--border);border-radius:18px;background:var(--card-solid);color:var(--fg);box-shadow:0 28px 90px #0007}}dialog::backdrop{{background:#07101fb8;backdrop-filter:blur(4px)}}.dialog-body{{padding:24px}}.dialog-body h2{{margin-top:0}}.dialog-actions{{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}}
 .is-loading:before{{content:'';width:13px;height:13px;border:2px solid #ffffff70;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}}
 @media(max-width:850px){{nav{{flex-wrap:wrap}}nav b{{width:calc(100% - 112px)}}nav a{{flex:1;text-align:center}}nav a[href='/task']{{order:3;flex-basis:100%}}main{{padding-top:24px}}.settings-grid{{grid-template-columns:1fr}}}}
-@media(max-width:640px){{header{{position:sticky;top:0}}nav{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px 4px;padding:9px 10px 10px}}nav b{{grid-column:1/4;grid-row:1;width:auto;min-width:0;margin:0;padding:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.brand-icon{{width:32px;height:32px;flex-basis:32px;padding:7px}}.theme-switch{{grid-column:4/6;grid-row:1;justify-self:end;margin-left:0}}nav>a:not([href='/logout']){{grid-row:2;min-width:0;min-height:42px;display:flex;align-items:center;justify-content:center;padding:8px 2px;background:var(--brand-tile);border:1px solid var(--header-border);font-size:12px;line-height:1;white-space:nowrap;text-align:center;box-shadow:none}}nav>a[href='/']{{grid-column:1}}nav>a[href='/tasks']{{grid-column:2}}nav>a[href='/logs']{{grid-column:3}}nav>a[href='/settings']{{grid-column:4}}nav>a[href='/task']{{grid-column:5}}nav a[href='/logout']{{display:none}}main{{padding:20px 11px 44px}}.grid{{gap:18px}}.card{{padding:18px;border-radius:15px}}main>.card{{margin-top:20px}}.page-heading{{display:block;margin-bottom:18px}}.page-heading .btn{{margin-top:12px;width:100%}}.task-card .row button,.task-card .row .btn{{flex:1}}.task-meta,.form-grid{{grid-template-columns:1fr}}.form-section{{padding:16px;margin-top:16px}}.form-actions{{bottom:7px}}.form-actions button{{flex:1}}.backup-file{{grid-template-columns:38px minmax(0,1fr);gap:11px;padding:13px}}.backup-file-icon{{width:38px;height:38px;padding:9px}}.backup-file form{{grid-column:1/-1;display:block}}.backup-file button{{width:100%}}.danger-zone{{align-items:stretch;flex-direction:column;padding:18px}}.danger-zone form,.danger-zone button{{width:100%}}.toast-stack{{top:12px;right:14px}}.disk-tip{{opacity:1;transform:none;position:static;margin-top:12px}}}}
+@media(max-width:640px){{header{{position:sticky;top:0}}nav{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px 4px;padding:9px 10px 10px}}nav b{{grid-column:1/5;grid-row:1;width:auto;min-width:0;margin:0;padding:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.brand-icon{{width:32px;height:32px;flex-basis:32px;padding:7px}}.theme-switch{{grid-column:5/7;grid-row:1;justify-self:end;margin-left:0}}nav>a:not([href='/logout']){{grid-row:2;min-width:0;min-height:42px;display:flex;align-items:center;justify-content:center;padding:8px 2px;background:var(--brand-tile);border:1px solid var(--header-border);font-size:12px;line-height:1;white-space:nowrap;text-align:center;box-shadow:none}}nav>a[href='/']{{grid-column:1}}nav>a[href='/tasks']{{grid-column:2}}nav>a[href='/logs']{{grid-column:3}}nav>a[href='/offsite']{{grid-column:4}}nav>a[href='/settings']{{grid-column:5}}nav>a[href='/task']{{grid-column:6}}nav a[href='/logout']{{display:none}}main{{padding:20px 11px 44px}}.grid{{gap:18px}}.card{{padding:18px;border-radius:15px}}main>.card{{margin-top:20px}}.page-heading{{display:block;margin-bottom:18px}}.page-heading .btn{{margin-top:12px;width:100%}}.task-card .row button,.task-card .row .btn{{flex:1}}.task-meta,.form-grid{{grid-template-columns:1fr}}.form-section{{padding:16px;margin-top:16px}}.form-actions{{bottom:7px}}.form-actions button{{flex:1}}.backup-file{{grid-template-columns:38px minmax(0,1fr);gap:11px;padding:13px}}.backup-file-icon{{width:38px;height:38px;padding:9px}}.backup-file form{{grid-column:1/-1;display:block}}.backup-file button{{width:100%}}.danger-zone{{align-items:stretch;flex-direction:column;padding:18px}}.danger-zone form,.danger-zone button{{width:100%}}.toast-stack{{top:12px;right:14px}}.disk-tip{{opacity:1;transform:none;position:static;margin-top:12px}}}}
 @media(max-width:380px){{nav b{{font-size:16px;gap:8px}}nav>a:not([href='/logout']){{font-size:11px;letter-spacing:-.02em}}}}
 @media(prefers-reduced-motion:reduce){{*,*:before,*:after{{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}}}
 </style></head><body><header><nav><b><span class="brand-icon">{BRAND_ICON}</span>Simple Backup</b><a href="/">首页</a><a href="/tasks">任务</a>
-<a href="/logs">日志</a><a href="/settings">设置</a><a href="/task">新建任务</a><div class="theme-switch" id="theme-switch" role="group" aria-label="主题模式"><button type="button" class="theme-option" data-theme-value="auto" aria-label="跟随系统" title="跟随系统">{THEME_ICONS['auto']}</button><button type="button" class="theme-option" data-theme-value="light" aria-label="日间模式" title="日间模式">{THEME_ICONS['light']}</button><button type="button" class="theme-option" data-theme-value="dark" aria-label="夜间模式" title="夜间模式">{THEME_ICONS['dark']}</button></div><a href="/logout">退出</a></nav></header>
+<a href="/logs">日志</a><a href="/offsite">容灾</a><a href="/settings">设置</a><a href="/task">新建任务</a><div class="theme-switch" id="theme-switch" role="group" aria-label="主题模式"><button type="button" class="theme-option" data-theme-value="auto" aria-label="跟随系统" title="跟随系统">{THEME_ICONS['auto']}</button><button type="button" class="theme-option" data-theme-value="light" aria-label="日间模式" title="日间模式">{THEME_ICONS['light']}</button><button type="button" class="theme-option" data-theme-value="dark" aria-label="夜间模式" title="夜间模式">{THEME_ICONS['dark']}</button></div><a href="/logout">退出</a></nav></header>
 <main>{body}</main><div class='toast-stack' id='toast-stack' aria-live='polite'></div><dialog id='confirm-dialog'><div class='dialog-body'><h2>确认操作</h2><p id='confirm-message'></p><div class='dialog-actions'><button type='button' class='secondary' id='confirm-cancel'>取消</button><button type='button' class='danger' id='confirm-ok'>确认</button></div></div></dialog><script>
 const addHidden=(f,n,v)=>{{let i=f.querySelector('input[name='+n+']');if(!i){{i=document.createElement('input');i.type='hidden';i.name=n;f.appendChild(i)}}i.value=v}};
 document.querySelectorAll('form').forEach(f=>{{if(f.method.toLowerCase()==='post'){{addHidden(f,'csrf','{csrf}');addHidden(f,'return_to',location.pathname+location.search)}}}});
-let current=location.pathname==='/'?'home':location.pathname==='/tasks'||location.pathname==='/task'&&location.search?'tasks':location.pathname==='/task'?'new':location.pathname.startsWith('/logs')?'logs':location.pathname==='/settings'?'settings':'';
-let navLinks=[...document.querySelectorAll('nav a')];let activeLink=current==='home'?navLinks.find(a=>a.getAttribute('href')==='/'):navLinks.find(a=>current==='tasks'&&a.getAttribute('href')==='/tasks'||current==='new'&&a.getAttribute('href')==='/task'||current==='logs'&&a.getAttribute('href')==='/logs'||current==='settings'&&a.getAttribute('href')==='/settings');activeLink?.classList.add('active');
+let current=location.pathname==='/'?'home':location.pathname==='/tasks'||location.pathname==='/task'&&location.search?'tasks':location.pathname==='/task'?'new':location.pathname.startsWith('/logs')?'logs':location.pathname==='/offsite'?'offsite':location.pathname==='/settings'?'settings':'';
+let navLinks=[...document.querySelectorAll('nav a')];let activeLink=current==='home'?navLinks.find(a=>a.getAttribute('href')==='/'):navLinks.find(a=>current==='tasks'&&a.getAttribute('href')==='/tasks'||current==='new'&&a.getAttribute('href')==='/task'||current==='logs'&&a.getAttribute('href')==='/logs'||current==='offsite'&&a.getAttribute('href')==='/offsite'||current==='settings'&&a.getAttribute('href')==='/settings');activeLink?.classList.add('active');
 const tailLogs=()=>document.querySelectorAll('pre.tail-log').forEach(p=>p.scrollTop=p.scrollHeight);
 addEventListener('pageshow',()=>requestAnimationFrame(tailLogs));
 const themeSwitch=document.getElementById('theme-switch'),themeOptions=[...themeSwitch.querySelectorAll('[data-theme-value]')];
@@ -1550,6 +1617,25 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
 <div class="form-actions settings-actions"><a class="btn secondary" href="/">取消</a><button data-loading="正在保存…">保存全部设置</button></div></form>"""
         return self.page("设置", body, token)
 
+    def offsite_html(self, token):
+        cfg = self.config
+        checked = "checked" if cfg.get("offsite_enabled") else ""
+        selected = lambda value: "selected" if cfg.get("offsite_auth_method") == value else ""
+        state = self.state.get("offsite", {})
+        status = state.get("last_result") or "尚未上传"
+        detail = state.get("last_error") or state.get("last_backup") or "启用后，每次备份成功都会自动上传一份到容灾服务器。"
+        body = f"""<div class="page-heading"><div><span class="card-kicker">Offsite</span><h1>容灾备份</h1><p class="muted">把本机生成的备份文件再上传到另一台服务器，防止备份服务器自身丢数据。</p></div></div>
+<form method="post" action="/offsite" class="settings-form"><section class="card form-shell"><div class="card-heading"><div><span class="card-kicker">Target</span><h2>容灾目标服务器</h2></div><span class="badge {'success' if status == '成功' else 'failed' if status == '失败' else 'waiting'}"><span class="status-dot"></span>{self.esc(status)}</span></div>
+<div class="form-section compact"><div class="section-heading"><span class="section-icon">R</span><div><h2>上传设置</h2><p>保存后会在后续备份成功时自动上传。</p></div></div>
+<div class="check-row"><label><input type="checkbox" name="enabled" {checked}> 启用容灾上传</label></div>
+<div class="form-grid"><div><label>容灾服务器 IP / 域名</label><input name="offsite_host" value="{self.esc(cfg.get('offsite_host', ''))}" placeholder="例如 backup2.example.com"></div><div><label>SSH 端口</label><input name="offsite_port" type="number" min="1" max="65535" required value="{cfg.get('offsite_port', 22)}"></div>
+<div><label>SSH 用户名</label><input name="offsite_user" required value="{self.esc(cfg.get('offsite_user', 'root'))}"></div><div><label>SSH 登录方式</label><select id="auth-method" name="offsite_auth_method"><option value="key" {selected('key')}>SSH 私钥</option><option value="password" {selected('password')}>SSH 密码</option></select></div>
+<div class="wide" id="key-auth"><label>SSH 私钥路径</label><input name="offsite_ssh_key" value="{self.esc(cfg.get('offsite_ssh_key', ''))}"><small class="muted">填写备份服务器上的绝对路径。</small></div><div class="wide" id="password-auth"><label>SSH 密码</label><input name="offsite_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">编辑时留空表示不修改，密码只保存在 root 可读的密钥文件中。</small></div>
+<div class="wide"><label>远端保存目录</label><input name="offsite_remote_path" required value="{self.esc(cfg.get('offsite_remote_path', ''))}"><small class="muted">程序会自动创建这个目录。</small></div></div></div>
+<div class="form-section compact"><div class="section-heading"><span class="section-icon">S</span><div><h2>最近上传状态</h2><p>{self.esc(detail)}</p></div></div><p class="muted">最近时间：{self.esc(state.get('last_time', '暂无'))}</p></div>
+<div class="form-actions settings-actions"><a class="btn secondary" href="/">取消</a><button data-loading="正在保存…">保存容灾设置</button></div></section></form>"""
+        return self.page("容灾备份", body, token)
+
     @staticmethod
     def login_html(error=""):
         alert = f"<div class='login-alert' role='alert'><span>!</span><p>{html.escape(error)}</p></div>" if error else ""
@@ -1635,6 +1721,49 @@ document.getElementById('login-form').addEventListener('submit',()=>{{let button
             elif database_password:
                 self.set_task_secret(task["id"], "database_password", database_password)
         return task
+
+    def save_offsite_form(self, form):
+        enabled = "enabled" in form
+        host = form.get("offsite_host", "").strip()
+        user = form.get("offsite_user", "").strip()
+        auth_method = form.get("offsite_auth_method", "key").strip()
+        ssh_key = form.get("offsite_ssh_key", "").strip()
+        remote_path = form.get("offsite_remote_path", "").strip()
+        password = form.get("offsite_password", "")
+        try:
+            port = int(form.get("offsite_port", 22))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("容灾 SSH 端口必须是数字") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("容灾 SSH 端口必须在 1-65535 之间")
+        if auth_method not in ("key", "password"):
+            raise ValueError("容灾 SSH 认证方式无效")
+        if password and ("\0" in password or len(password) > 512):
+            raise ValueError("容灾 SSH 密码无效")
+        if enabled:
+            if not re.fullmatch(r"[A-Za-z0-9._:-]+", host):
+                raise ValueError("容灾服务器地址只能使用域名、IP 或 IPv6 地址字符")
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", user):
+                raise ValueError("容灾 SSH 用户名格式无效")
+            if not remote_path.startswith("/") or any(ord(c) < 32 for c in remote_path):
+                raise ValueError("容灾远端保存目录必须是绝对路径")
+            if auth_method == "key" and (not ssh_key or not Path(ssh_key).is_absolute()):
+                raise ValueError("容灾 SSH 私钥路径必须是绝对路径")
+            if auth_method == "password" and not password and not self.offsite_password():
+                raise ValueError("选择密码登录时必须填写容灾 SSH 密码")
+        with self.lock:
+            self.config.update(
+                offsite_enabled=enabled, offsite_host=host, offsite_port=port,
+                offsite_user=user, offsite_auth_method=auth_method,
+                offsite_ssh_key=ssh_key, offsite_remote_path=remote_path,
+            )
+            self._save_config()
+            if auth_method == "password":
+                if password:
+                    self.set_offsite_password(password)
+            else:
+                self.set_offsite_password("")
+
 
 class Handler(BaseHTTPRequestHandler):
     app = None
@@ -1772,6 +1901,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(self.app.task_detail_html(task, token))
         elif path.path == "/settings":
             self.send_html(self.app.settings_html(token))
+        elif path.path == "/offsite":
+            self.send_html(self.app.offsite_html(token))
         elif path.path == "/logs":
             self.send_html(self.app.logs_html(token))
         elif path.path == "/logs/raw":
@@ -1927,6 +2058,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Telegram 测试失败：" + error)
             self.app.log("Telegram 测试消息发送成功")
             self.redirect_notice(form, 'Telegram 测试消息已发送，请检查机器人会话', '/settings')
+        elif path == "/offsite":
+            self.app.save_offsite_form(form)
+            self.redirect_notice(form, '容灾设置已保存', '/offsite')
         else:
             raise ValueError("未知操作")
 

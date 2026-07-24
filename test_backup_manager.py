@@ -244,6 +244,25 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("database-secret", secret_text)
             self.assertNotIn("database-secret", app.config_path.read_text(encoding="utf-8"))
 
+            app.save_offsite_form({
+                "enabled": "on", "offsite_host": "dr.example.com", "offsite_port": "2222",
+                "offsite_user": "root", "offsite_auth_method": "password",
+                "offsite_remote_path": "/srv/offsite", "offsite_password": "offsite-secret",
+            })
+            self.assertEqual(app.offsite_password(), "offsite-secret")
+            self.assertNotIn("offsite-secret", app.config_path.read_text(encoding="utf-8"))
+            archive = root / "mysql-backups" / "backup.tar.zst"
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            archive.write_bytes(b"x")
+            calls = []
+            app.execute = lambda command, *_args, **_kwargs: (calls.append(command) or (0, ""))
+            app.notify = lambda *_args, **_kwargs: None
+            app.upload_offsite(database_task, archive, {"phase": ""})
+            self.assertIn("mkdir -p -- /srv/offsite", calls[0])
+            self.assertEqual(calls[1][0], "rsync")
+            self.assertIn("--partial", calls[1])
+            self.assertIn("root@dr.example.com:/srv/offsite/", calls[1])
+
             for _ in range(5):
                 app.login_failed("192.0.2.1")
             self.assertFalse(app.login_allowed("192.0.2.1"))
@@ -263,10 +282,11 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("tail-log", home_html)
             self.assertLess(home_html.index('href="/task">新建任务'), home_html.index('id="theme-switch"'))
             self.assertNotIn("nav a[href='/task']{{background", home_html)
-            self.assertIn("grid-template-columns:repeat(5,minmax(0,1fr))", home_html)
+            self.assertIn("grid-template-columns:repeat(6,minmax(0,1fr))", home_html)
             self.assertIn("nav>a:not([href='/logout'])", home_html)
-            self.assertIn("nav>a[href='/task']{grid-column:5", home_html)
-            self.assertIn(".theme-switch{grid-column:4/6;grid-row:1", home_html)
+            self.assertIn("nav>a[href='/offsite']{grid-column:4", home_html)
+            self.assertIn("nav>a[href='/task']{grid-column:6", home_html)
+            self.assertIn(".theme-switch{grid-column:5/7;grid-row:1", home_html)
             self.assertIn("scrollHeight", app.logs_html(app.sign_session("panel-user")))
             self.assertIn("pageshow", app.logs_html(app.sign_session("panel-user")))
             self.assertIn("@media(max-width:640px)", app.home_html(app.sign_session("panel-user")))
@@ -402,8 +422,10 @@ class BackupManagerTest(unittest.TestCase):
                 "@media(max-width:640px)", 'rel="icon"', "brand-icon",
                 "theme-switch", "theme-option", "--header-fg", "text-overflow:ellipsis",
                 "task-value", "task-endpoint", "padding-top:28px", ".log-shell pre{margin:0}",
+                'href="/offsite">容灾',
             ):
                 self.assertIn(marker, home)
+            self.assertIn("容灾目标服务器", app.offsite_html(token))
 
             backup_dir = Path(task["backup_dir"])
             backup_dir.mkdir(parents=True, exist_ok=True)
