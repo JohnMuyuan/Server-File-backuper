@@ -262,6 +262,23 @@ class BackupManagerTest(unittest.TestCase):
             self.assertEqual(calls[1][0], "rsync")
             self.assertIn("--partial", calls[1])
             self.assertIn("root@dr.example.com:/srv/offsite/", calls[1])
+            all_archive = Path(database_task["backup_dir"]) / f"20260724-120000_{backup_prefix(database_task)}.tar.zst"
+            all_archive.write_bytes(b"all")
+            uploaded = []
+            app.upload_offsite = lambda _task, path, _job: uploaded.append(path.name)
+            ok, message = app.start_offsite_upload_all()
+            self.assertTrue(ok)
+            self.assertIn("已开始容灾上传", message)
+            for _ in range(20):
+                if uploaded:
+                    break
+                time.sleep(0.05)
+            self.assertIn(all_archive.name, uploaded)
+            for _ in range(20):
+                if app.offsite_job is None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNone(app.offsite_job)
 
             for _ in range(5):
                 app.login_failed("192.0.2.1")
@@ -426,6 +443,8 @@ class BackupManagerTest(unittest.TestCase):
             ):
                 self.assertIn(marker, home)
             self.assertIn("容灾目标服务器", app.offsite_html(token))
+            self.assertIn("/offsite/run", app.offsite_html(token))
+            self.assertIn("一键容灾当前所有存档", app.offsite_html(token))
 
             backup_dir = Path(task["backup_dir"])
             backup_dir.mkdir(parents=True, exist_ok=True)

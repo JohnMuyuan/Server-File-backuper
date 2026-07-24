@@ -331,6 +331,7 @@ class BackupApp:
         self.state.setdefault("low_disks", {})
         self.state.setdefault("offsite", {})
         self.jobs = {}
+        self.offsite_job = None
         self.login_failures = {}
         self.account_failures = []
         self.login_lock = threading.Lock()
@@ -1009,6 +1010,49 @@ class BackupApp:
         self._save_state()
         self.notify(f"容灾上传成功：{task['name']}\n文件名：{backup_path.name}\n目标：{remote_path}", task["id"])
 
+    def start_offsite_upload_all(self):
+        if not self.config.get("offsite_enabled"):
+            return False, "请先启用并保存容灾上传设置"
+        items = [(dict(task), path) for task in self.config["tasks"] for path in self.backups(task)]
+        if not items:
+            return False, "当前没有可上传的备份存档"
+        with self.lock:
+            if self.offsite_job:
+                return False, "容灾上传正在运行"
+            job = {"stop": threading.Event(), "process": None, "phase": "正在容灾全部存档", "progress": 0}
+            self.offsite_job = job
+            self.state["offsite"] = {
+                "last_result": "运行中", "last_backup": f"0/{len(items)}",
+                "last_time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "last_error": "",
+            }
+            self._save_state()
+        threading.Thread(target=self._offsite_upload_all_worker, args=(items, job), daemon=True).start()
+        return True, f"已开始容灾上传 {len(items)} 个已有备份"
+
+    def _offsite_upload_all_worker(self, items, job):
+        failures = []
+        try:
+            self.notify(f"容灾上传开始：共 {len(items)} 个已有备份")
+            for index, (task, path) in enumerate(items, 1):
+                try:
+                    self.upload_offsite(task, path, job)
+                except Exception as exc:
+                    failures.append(f"{task['name']} / {path.name}: {exc}")
+                    self.log(f"容灾上传失败：{failures[-1]}", "ERROR", task["id"])
+                job["progress"] = int(index * 100 / len(items))
+                self.state["offsite"].update(last_backup=f"{index}/{len(items)}", last_time=f"{datetime.now():%Y-%m-%d %H:%M:%S}")
+                self._save_state()
+            if failures:
+                self.state["offsite"].update(last_result="失败", last_error=" | ".join(failures[:3])[:1600])
+                self.notify(f"容灾上传完成但有失败：{len(failures)}/{len(items)} 个失败\n原因：{self.state['offsite']['last_error']}")
+            else:
+                self.state["offsite"].update(last_result="成功", last_error="")
+                self.notify(f"容灾上传完成：{len(items)} 个已有备份已上传")
+            self._save_state()
+        finally:
+            with self.lock:
+                self.offsite_job = None
+
     def backups(self, task):
         root = Path(task["backup_dir"])
         suffix = "_" + backup_prefix(task)
@@ -1622,17 +1666,18 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
         checked = "checked" if cfg.get("offsite_enabled") else ""
         selected = lambda value: "selected" if cfg.get("offsite_auth_method") == value else ""
         state = self.state.get("offsite", {})
-        status = state.get("last_result") or "尚未上传"
+        running = self.offsite_job is not None
+        status = "运行中" if running else state.get("last_result") or "尚未上传"
         detail = state.get("last_error") or state.get("last_backup") or "启用后，每次备份成功都会自动上传一份到容灾服务器。"
         body = f"""<div class="page-heading"><div><span class="card-kicker">Offsite</span><h1>容灾备份</h1><p class="muted">把本机生成的备份文件再上传到另一台服务器，防止备份服务器自身丢数据。</p></div></div>
-<form method="post" action="/offsite" class="settings-form"><section class="card form-shell"><div class="card-heading"><div><span class="card-kicker">Target</span><h2>容灾目标服务器</h2></div><span class="badge {'success' if status == '成功' else 'failed' if status == '失败' else 'waiting'}"><span class="status-dot"></span>{self.esc(status)}</span></div>
+<form method="post" action="/offsite" class="settings-form"><section class="card form-shell"><div class="card-heading"><div><span class="card-kicker">Target</span><h2>容灾目标服务器</h2></div><span class="badge {'running' if running else 'success' if status == '成功' else 'failed' if status == '失败' else 'waiting'}"><span class="status-dot"></span>{self.esc(status)}</span></div>
 <div class="form-section compact"><div class="section-heading"><span class="section-icon">R</span><div><h2>上传设置</h2><p>保存后会在后续备份成功时自动上传。</p></div></div>
 <div class="check-row"><label><input type="checkbox" name="enabled" {checked}> 启用容灾上传</label></div>
 <div class="form-grid"><div><label>容灾服务器 IP / 域名</label><input name="offsite_host" value="{self.esc(cfg.get('offsite_host', ''))}" placeholder="例如 backup2.example.com"></div><div><label>SSH 端口</label><input name="offsite_port" type="number" min="1" max="65535" required value="{cfg.get('offsite_port', 22)}"></div>
 <div><label>SSH 用户名</label><input name="offsite_user" required value="{self.esc(cfg.get('offsite_user', 'root'))}"></div><div><label>SSH 登录方式</label><select id="auth-method" name="offsite_auth_method"><option value="key" {selected('key')}>SSH 私钥</option><option value="password" {selected('password')}>SSH 密码</option></select></div>
 <div class="wide" id="key-auth"><label>SSH 私钥路径</label><input name="offsite_ssh_key" value="{self.esc(cfg.get('offsite_ssh_key', ''))}"><small class="muted">填写备份服务器上的绝对路径。</small></div><div class="wide" id="password-auth"><label>SSH 密码</label><input name="offsite_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">编辑时留空表示不修改，密码只保存在 root 可读的密钥文件中。</small></div>
 <div class="wide"><label>远端保存目录</label><input name="offsite_remote_path" required value="{self.esc(cfg.get('offsite_remote_path', ''))}"><small class="muted">程序会自动创建这个目录。</small></div></div></div>
-<div class="form-section compact"><div class="section-heading"><span class="section-icon">S</span><div><h2>最近上传状态</h2><p>{self.esc(detail)}</p></div></div><p class="muted">最近时间：{self.esc(state.get('last_time', '暂无'))}</p></div>
+<div class="form-section compact"><div class="section-heading"><span class="section-icon">S</span><div><h2>最近上传状态</h2><p>{self.esc(detail)}</p></div></div><p class="muted">最近时间：{self.esc(state.get('last_time', '暂无'))}</p><div class="form-actions inner"><button class="secondary" formaction="/offsite/run" data-loading="正在启动…" {'disabled' if running else ''}>一键容灾当前所有存档</button></div></div>
 <div class="form-actions settings-actions"><a class="btn secondary" href="/">取消</a><button data-loading="正在保存…">保存容灾设置</button></div></section></form>"""
         return self.page("容灾备份", body, token)
 
@@ -1951,7 +1996,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError) as exc:
             self.app.log(f"网页操作失败 {self.path}：{exc}", "ERROR")
             if self.authenticated():
-                self.redirect_notice(form, str(exc), '/tasks', 'error')
+                fallback = '/offsite' if urllib.parse.urlsplit(self.path).path.startswith('/offsite') else '/tasks'
+                self.redirect_notice(form, str(exc), fallback, 'error')
             else:
                 token = self.session_token()
                 self.send_html(self.app.page("操作失败", f"<section class='card'><h1>操作失败</h1><p class='bad'>{html.escape(str(exc))}</p></section>", token), 400)
@@ -2061,6 +2107,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/offsite":
             self.app.save_offsite_form(form)
             self.redirect_notice(form, '容灾设置已保存', '/offsite')
+        elif path == "/offsite/run":
+            ok, message = self.app.start_offsite_upload_all()
+            if not ok:
+                raise ValueError(message)
+            self.redirect_notice(form, message, '/offsite')
         else:
             raise ValueError("未知操作")
 
