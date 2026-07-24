@@ -86,6 +86,9 @@ class BackupManagerTest(unittest.TestCase):
             password_task = {**task, "auth_method": "password"}
             app.set_task_password(task["id"], "remote secret")
             self.assertIn("sshpass -e ssh", " ".join(app.transfer_command(password_task, root / "partial")))
+            jump_task = sample_task(root / "jump", ssh_proxy_jump="root@jump.example.com:22")
+            jump_rsync = app.transfer_command(jump_task, root / "jump-partial")
+            self.assertIn("-J root@jump.example.com:22", jump_rsync[jump_rsync.index("-e") + 1])
             mysql_task = sample_task(
                 root / "mysql", source_type="mysql", database_user="backup",
                 database_name="app", database_port=0,
@@ -93,6 +96,7 @@ class BackupManagerTest(unittest.TestCase):
             mysql_command = " ".join(app.database_command(mysql_task))
             self.assertIn("mysqldump", mysql_command)
             self.assertNotIn("database-secret", mysql_command)
+            self.assertIn("-J", app.database_command({**mysql_task, "ssh_proxy_jump": "root@jump.example.com:22"}))
             self.assertIn("redis-cli", " ".join(app.database_command({
                 **mysql_task, "source_type": "redis", "database_user": "", "database_name": "",
             })))
@@ -186,7 +190,7 @@ class BackupManagerTest(unittest.TestCase):
             for change in (
                 {"remote_host": "bad host;rm"}, {"backup_dir": "/"},
                 {"transfer_threads": 16999}, {"remote_path": "relative"},
-                {"file_mode": "replace-existing"},
+                {"file_mode": "replace-existing"}, {"ssh_proxy_jump": "root@jump.example.com:bad"},
             ):
                 with self.assertRaises(ValueError):
                     sample_task(root / "backup", **change)
@@ -461,6 +465,7 @@ class BackupManagerTest(unittest.TestCase):
                 "danger-zone", "danger-outline", "删除文件", long_name,
             ):
                 self.assertIn(marker, task_form)
+            self.assertIn("SSH 中转服务器", task_form)
 
             settings = app.settings_html(token)
             self.assertIn("settings-grid", settings)

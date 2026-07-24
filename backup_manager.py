@@ -57,6 +57,7 @@ DEFAULTS = {
 TASK_DEFAULTS = {
     "id": "", "name": "新备份任务", "remote_host": "", "remote_port": 22,
     "remote_user": "root", "remote_path": "/", "ssh_key": "/root/.ssh/id_ed25519",
+    "ssh_proxy_jump": "",
     "source_type": "files", "file_mode": "snapshot",
     "database_host": "127.0.0.1", "database_port": 0,
     "database_user": "", "database_name": "",
@@ -177,7 +178,7 @@ def validate_task(raw, existing_id=""):
     task.update(raw)
     task["id"] = str(existing_id or task.get("id") or secrets.token_hex(4)).lower()
     for key in (
-        "name", "remote_host", "remote_user", "remote_path", "ssh_key", "backup_dir",
+        "name", "remote_host", "remote_user", "remote_path", "ssh_key", "ssh_proxy_jump", "backup_dir",
         "source_type", "file_mode", "database_host", "database_user", "database_name",
     ):
         task[key] = str(task.get(key, "")).strip()
@@ -233,6 +234,11 @@ def validate_task(raw, existing_id=""):
         raise ValueError("SSH 密钥路径必须是绝对路径")
     if task["auth_method"] not in ("key", "password"):
         raise ValueError("SSH 认证方式无效")
+    if task["ssh_proxy_jump"] and (
+        len(task["ssh_proxy_jump"]) > 200
+        or not re.fullmatch(r"(?:[A-Za-z0-9._-]+@)?(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])(?::[0-9]{1,5})?", task["ssh_proxy_jump"])
+    ):
+        raise ValueError("SSH 中转服务器格式无效，请填写类似 root@1.2.3.4:22")
     if not 1 <= task["remote_port"] <= 65535:
         raise ValueError("SSH 端口必须在 1-65535 之间")
     if not 0 <= task["database_port"] <= 65535:
@@ -1639,7 +1645,7 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
         body = f"""<div class="page-heading"><div><span class="card-kicker">Task Setup</span><h1>{'编辑任务' if task_id else '新建备份任务'}</h1><p class="muted">按区域填写即可，隐藏的选项不会参与保存。</p></div><a class="btn secondary" href="/tasks">返回任务列表</a></div>
 <section class="card form-shell"><form method="post" action="/task/save"><input type="hidden" name="id" value="{task_id}">
 <div class="form-section"><div class="section-heading"><span class="section-icon">1</span><div><h2>基本信息</h2><p>给任务命名并选择要备份的数据类型。</p></div></div><div class="form-grid"><div><label>任务名称</label><input name="name" required maxlength="50" value="{self.esc(task['name'])}"></div><div><label>备份类型</label><select id="source-type" name="source_type"><option value="files" {source_selected('files')}>文件 / 目录</option><option value="mysql" {source_selected('mysql')}>MySQL / MariaDB</option><option value="postgresql" {source_selected('postgresql')}>PostgreSQL</option><option value="redis" {source_selected('redis')}>Redis</option></select></div></div></div>
-<div class="form-section"><div class="section-heading"><span class="section-icon">2</span><div><h2>远程服务器与认证</h2><p>程序通过 SSH 安全连接远程服务器。</p></div></div><div class="form-grid"><div><label>远程服务器 IP / 域名</label><input name="remote_host" required value="{self.esc(task['remote_host'])}"></div><div><label>SSH 端口</label><input name="remote_port" type="number" min="1" max="65535" required value="{task['remote_port']}"></div><div><label>SSH 用户名</label><input name="remote_user" required value="{self.esc(task['remote_user'])}"></div><div><label>SSH 登录方式</label><select id="auth-method" name="auth_method"><option value="key" {selected('key')}>SSH 私钥</option><option value="password" {selected('password')}>SSH 密码</option></select></div><div class="wide" id="key-auth"><label>SSH 私钥路径</label><input name="ssh_key" value="{self.esc(task['ssh_key'])}"><small class="muted">填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small></div><div class="wide" id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div></div></div>
+<div class="form-section"><div class="section-heading"><span class="section-icon">2</span><div><h2>远程服务器与认证</h2><p>程序通过 SSH 安全连接远程服务器。</p></div></div><div class="form-grid"><div><label>远程服务器 IP / 域名</label><input name="remote_host" required value="{self.esc(task['remote_host'])}"></div><div><label>SSH 端口</label><input name="remote_port" type="number" min="1" max="65535" required value="{task['remote_port']}"></div><div><label>SSH 用户名</label><input name="remote_user" required value="{self.esc(task['remote_user'])}"></div><div><label>SSH 登录方式</label><select id="auth-method" name="auth_method"><option value="key" {selected('key')}>SSH 私钥</option><option value="password" {selected('password')}>SSH 密码</option></select></div><div class="wide" id="key-auth"><label>SSH 私钥路径</label><input name="ssh_key" value="{self.esc(task['ssh_key'])}"><small class="muted">填写备份服务器上的绝对路径，例如 /root/.ssh/id_ed25519。</small></div><div class="wide" id="password-auth"><label>SSH 密码</label><input name="ssh_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">编辑已有任务时留空表示不修改。密码单独保存在仅 root 可读的文件中。</small></div><div class="wide"><label>SSH 中转服务器（可选）</label><input name="ssh_proxy_jump" value="{self.esc(task['ssh_proxy_jump'])}" placeholder="例如 root@1.2.3.4:22"><small class="muted">备份服务器不能稳定直连源服务器时填写；中转服务器建议提前配置免密 SSH。</small></div></div></div>
 <div class="form-section"><div class="section-heading"><span class="section-icon">3</span><div><h2>备份来源</h2><p>只会显示当前备份类型需要的字段。</p></div></div><div id="file-source"><label>远程文件或目录</label><input id="remote-path" name="remote_path" required value="{self.esc(task['remote_path'])}"><label>文件保存方式</label><select id="file-mode" name="file_mode"><option value="snapshot" {file_mode_selected('snapshot')}>快照压缩包</option><option value="incremental" {file_mode_selected('incremental')}>增量归档（只新增、不压缩）</option><option value="mirror" {file_mode_selected('mirror')}>完全镜像同步（不压缩）</option></select><small class="muted">增量归档只添加新文件；完全镜像会同步新增、修改和删除。两种模式都使用一个固定目录。</small></div><div id="database-source" class="form-grid"><div><label>数据库地址</label><input name="database_host" value="{self.esc(task['database_host'])}"><small class="muted">数据库在同一台远程服务器通常填 127.0.0.1。</small></div><div><label>数据库端口</label><input name="database_port" type="number" min="0" max="65535" value="{task['database_port']}"><small class="muted">填 0 自动使用默认端口。</small></div><div><label>数据库用户名</label><input id="database-user" name="database_user" maxlength="128" value="{self.esc(task['database_user'])}"></div><div><label>数据库名称</label><input id="database-name" name="database_name" maxlength="128" value="{self.esc(task['database_name'])}"><small class="muted">MySQL / PostgreSQL 必填；Redis 无需填写。</small></div><div class="wide"><label>数据库密码</label><input name="database_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">可留空用于免密连接；编辑时留空表示不修改。密码不会写入普通任务配置或命令行。</small></div></div></div>
 <div class="form-section"><div class="section-heading"><span class="section-icon">4</span><div><h2>存储与传输</h2><p>设置保存位置、保留策略与文件传输并发。</p></div></div><label>本地备份目录</label><input name="backup_dir" required value="{self.esc(task['backup_dir'])}"><div class="form-grid"><div id="retention-settings"><label>最多保留多少份</label><input name="retention_limit" type="number" min="0" required value="{task['retention_limit']}"><small class="muted">填 0 表示全部保留。</small></div><div id="file-threads"><label>并行线程数（1-16）</label><input name="transfer_threads" type="number" min="1" max="16" step="1" required value="{task['transfer_threads']}" oninput="if(+this.value>16)this.value=16;if(+this.value<1)this.value=1"><small class="muted">小文件较多时可适当提高。</small></div></div></div>
 <div class="form-section"><div class="section-heading"><span class="section-icon">5</span><div><h2>自动执行计划</h2><p>备份周期和一天内的时间点可以分别设置。</p></div></div><div class="form-grid"><div><label>每隔几天备份</label><input name="interval_days" type="number" min="1" max="3650" step="1" required value="{task['interval_days']}"></div><div><label>在这些时间点备份</label><div id="schedule-times">{time_inputs}</div><button type="button" class="secondary" id="add-time">＋ 添加时间</button><input type="hidden" id="schedule-times-value" name="schedule_times"><small class="muted">例如每隔 1 天，设置 02:00 和 14:00，就是每天备份两次。</small></div></div></div>
@@ -1726,7 +1732,7 @@ document.getElementById('login-form').addEventListener('submit',()=>{{let button
         task_id = form.get("id", "")
         old = self.task(task_id) if task_id else None
         raw = {key: form[key] for key in (
-            "name", "remote_host", "remote_port", "remote_user", "remote_path", "ssh_key",
+            "name", "remote_host", "remote_port", "remote_user", "remote_path", "ssh_key", "ssh_proxy_jump",
             "backup_dir", "interval_days", "retention_limit", "transfer_threads", "auth_method",
             "schedule_times", "source_type", "file_mode", "database_host", "database_port", "database_user",
             "database_name",
@@ -1747,7 +1753,7 @@ document.getElementById('login-form').addEventListener('submit',()=>{{let button
                 index = self.config["tasks"].index(old)
                 self.config["tasks"][index] = task
                 connection = (
-                    "remote_host", "remote_port", "remote_user", "ssh_key", "auth_method",
+                    "remote_host", "remote_port", "remote_user", "ssh_key", "ssh_proxy_jump", "auth_method",
                     "source_type", "database_host", "database_port",
                 )
                 if any(old[k] != task[k] for k in connection):
