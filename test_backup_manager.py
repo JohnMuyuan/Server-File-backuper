@@ -247,6 +247,7 @@ class BackupManagerTest(unittest.TestCase):
             app.save_offsite_form({
                 "enabled": "on", "offsite_host": "dr.example.com", "offsite_port": "2222",
                 "offsite_user": "root", "offsite_auth_method": "password",
+                "offsite_proxy_jump": "root@jump.example.com:22",
                 "offsite_remote_path": "/srv/offsite", "offsite_password": "offsite-secret",
             })
             self.assertEqual(app.offsite_password(), "offsite-secret")
@@ -258,9 +259,12 @@ class BackupManagerTest(unittest.TestCase):
             app.execute = lambda command, *_args, **_kwargs: (calls.append(command) or (0, ""))
             app.notify = lambda *_args, **_kwargs: None
             app.upload_offsite(database_task, archive, {"phase": ""})
+            self.assertIn("-J", calls[0])
+            self.assertIn("root@jump.example.com:22", calls[0])
             self.assertIn("mkdir -p -- /srv/offsite", calls[0])
             self.assertEqual(calls[1][0], "rsync")
             self.assertIn("--partial", calls[1])
+            self.assertIn("-J root@jump.example.com:22", calls[1][calls[1].index("-e") + 1])
             self.assertIn("root@dr.example.com:/srv/offsite/", calls[1])
             all_archive = Path(database_task["backup_dir"]) / f"20260724-120000_{backup_prefix(database_task)}.tar.zst"
             all_archive.write_bytes(b"all")
@@ -445,6 +449,7 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("容灾目标服务器", app.offsite_html(token))
             self.assertIn("/offsite/run", app.offsite_html(token))
             self.assertIn("一键容灾当前所有存档", app.offsite_html(token))
+            self.assertIn("SSH 中转服务器", app.offsite_html(token))
 
             backup_dir = Path(task["backup_dir"])
             backup_dir.mkdir(parents=True, exist_ok=True)

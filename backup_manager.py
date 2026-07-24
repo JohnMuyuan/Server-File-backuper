@@ -51,6 +51,7 @@ DEFAULTS = {
     "offsite_user": "root",
     "offsite_auth_method": "key",
     "offsite_ssh_key": "/root/.ssh/id_ed25519",
+    "offsite_proxy_jump": "",
     "offsite_remote_path": "/var/backups/simple-backup-offsite",
 }
 TASK_DEFAULTS = {
@@ -515,6 +516,8 @@ class BackupApp:
             options += ["-o", "PreferredAuthentications=password,keyboard-interactive", "-o", "PubkeyAuthentication=no"]
         elif task["ssh_key"]:
             options += ["-i", task["ssh_key"]]
+        if task.get("ssh_proxy_jump"):
+            options += ["-J", task["ssh_proxy_jump"]]
         return options
 
     def ssh_program(self, task):
@@ -527,6 +530,7 @@ class BackupApp:
             "auth_method": self.config["offsite_auth_method"],
             "remote_port": self.config["offsite_port"],
             "ssh_key": self.config["offsite_ssh_key"],
+            "ssh_proxy_jump": self.config.get("offsite_proxy_jump", ""),
         }
 
     def remote_setup(self, task, job):
@@ -1676,6 +1680,7 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
 <div class="form-grid"><div><label>容灾服务器 IP / 域名</label><input name="offsite_host" value="{self.esc(cfg.get('offsite_host', ''))}" placeholder="例如 backup2.example.com"></div><div><label>SSH 端口</label><input name="offsite_port" type="number" min="1" max="65535" required value="{cfg.get('offsite_port', 22)}"></div>
 <div><label>SSH 用户名</label><input name="offsite_user" required value="{self.esc(cfg.get('offsite_user', 'root'))}"></div><div><label>SSH 登录方式</label><select id="auth-method" name="offsite_auth_method"><option value="key" {selected('key')}>SSH 私钥</option><option value="password" {selected('password')}>SSH 密码</option></select></div>
 <div class="wide" id="key-auth"><label>SSH 私钥路径</label><input name="offsite_ssh_key" value="{self.esc(cfg.get('offsite_ssh_key', ''))}"><small class="muted">填写备份服务器上的绝对路径。</small></div><div class="wide" id="password-auth"><label>SSH 密码</label><input name="offsite_password" type="password" maxlength="512" autocomplete="new-password"><small class="muted">编辑时留空表示不修改，密码只保存在 root 可读的密钥文件中。</small></div>
+<div class="wide"><label>SSH 中转服务器（可选）</label><input name="offsite_proxy_jump" value="{self.esc(cfg.get('offsite_proxy_jump', ''))}" placeholder="例如 root@1.2.3.4:22"><small class="muted">备份服务器不能直连容灾服务器时填写；中转服务器建议提前配置免密 SSH。</small></div>
 <div class="wide"><label>远端保存目录</label><input name="offsite_remote_path" required value="{self.esc(cfg.get('offsite_remote_path', ''))}"><small class="muted">程序会自动创建这个目录。</small></div></div></div>
 <div class="form-section compact"><div class="section-heading"><span class="section-icon">S</span><div><h2>最近上传状态</h2><p>{self.esc(detail)}</p></div></div><p class="muted">最近时间：{self.esc(state.get('last_time', '暂无'))}</p><div class="form-actions inner"><button class="secondary" formaction="/offsite/run" data-loading="正在启动…" {'disabled' if running else ''}>一键容灾当前所有存档</button></div></div>
 <div class="form-actions settings-actions"><a class="btn secondary" href="/">取消</a><button data-loading="正在保存…">保存容灾设置</button></div></section></form>"""
@@ -1773,6 +1778,7 @@ document.getElementById('login-form').addEventListener('submit',()=>{{let button
         user = form.get("offsite_user", "").strip()
         auth_method = form.get("offsite_auth_method", "key").strip()
         ssh_key = form.get("offsite_ssh_key", "").strip()
+        proxy_jump = form.get("offsite_proxy_jump", "").strip()
         remote_path = form.get("offsite_remote_path", "").strip()
         password = form.get("offsite_password", "")
         try:
@@ -1783,6 +1789,11 @@ document.getElementById('login-form').addEventListener('submit',()=>{{let button
             raise ValueError("容灾 SSH 端口必须在 1-65535 之间")
         if auth_method not in ("key", "password"):
             raise ValueError("容灾 SSH 认证方式无效")
+        if proxy_jump and (
+            len(proxy_jump) > 200
+            or not re.fullmatch(r"(?:[A-Za-z0-9._-]+@)?(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:]+\])(?::[0-9]{1,5})?", proxy_jump)
+        ):
+            raise ValueError("SSH 中转服务器格式无效，请填写类似 root@1.2.3.4:22")
         if password and ("\0" in password or len(password) > 512):
             raise ValueError("容灾 SSH 密码无效")
         if enabled:
@@ -1800,7 +1811,8 @@ document.getElementById('login-form').addEventListener('submit',()=>{{let button
             self.config.update(
                 offsite_enabled=enabled, offsite_host=host, offsite_port=port,
                 offsite_user=user, offsite_auth_method=auth_method,
-                offsite_ssh_key=ssh_key, offsite_remote_path=remote_path,
+                offsite_ssh_key=ssh_key, offsite_proxy_jump=proxy_jump,
+                offsite_remote_path=remote_path,
             )
             self._save_config()
             if auth_method == "password":
