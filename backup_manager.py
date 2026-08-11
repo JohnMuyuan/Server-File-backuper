@@ -486,9 +486,64 @@ class BackupApp:
         except OSError:
             return "暂无日志"
 
-    def read_task_log(self, task_id):
-        marker = f"[task:{task_id}]"
-        return "".join(line for line in self.read_log(None).splitlines(True) if marker in line) or "该任务暂无日志"
+    @staticmethod
+    def _reverse_log_lines(path, block_size=64 * 1024):
+        """Yield a log file from newest to oldest without loading it all into memory."""
+        try:
+            with path.open("rb") as source:
+                source.seek(0, os.SEEK_END)
+                position = source.tell()
+                pending = b""
+                while position:
+                    size = min(block_size, position)
+                    position -= size
+                    source.seek(position)
+                    parts = (source.read(size) + pending).split(b"\n")
+                    pending = parts.pop(0)
+                    for line in reversed(parts):
+                        if line:
+                            yield line
+                if pending:
+                    yield pending
+        except OSError:
+            return
+
+    def read_log_page(self, page=0, lines_per_page=200, task_id=""):
+        """Return one bounded page, keeping large logs out of the rendered document."""
+        page = max(0, min(int(page), 1000))
+        lines_per_page = max(50, min(int(lines_per_page), 500))
+        marker = f"[task:{task_id}]".encode() if task_id else b""
+        skip = page * lines_per_page
+        matched = 0
+        selected = []
+        has_more = False
+        paths = (self.log_path.with_suffix(".log.1"), self.log_path)
+        for path in reversed(paths):
+            for line in self._reverse_log_lines(path):
+                if marker and marker not in line:
+                    continue
+                if matched < skip:
+                    matched += 1
+                    continue
+                if len(selected) < lines_per_page:
+                    selected.append(line.decode("utf-8", "replace"))
+                    matched += 1
+                    continue
+                has_more = True
+                break
+            if has_more:
+                break
+        selected.reverse()
+        empty = "该任务暂无日志" if task_id else "暂无日志"
+        return {
+            "text": "\n".join(selected) if selected else empty,
+            "page": page,
+            "has_more": has_more,
+            "line_count": len(selected),
+        }
+
+    def read_task_log(self, task_id, limit=200):
+        return self.read_log_page(0, limit, task_id)["text"]
 
     @staticmethod
     def send_telegram(token, chat_id, message):
@@ -1438,7 +1493,7 @@ button,.btn{{display:inline-flex;align-items:center;justify-content:center;gap:7
 .theme-switch{{display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--header-border);border-radius:12px;background:var(--brand-tile);box-shadow:inset 0 1px 2px #0000000a}}.theme-option{{width:31px;height:31px;min-height:31px;padding:7px;border:0;border-radius:9px;background:transparent;color:var(--header-muted);box-shadow:none}}.theme-option svg{{width:100%;height:100%}}.theme-option:hover{{background:var(--header-hover);color:var(--header-fg);box-shadow:none;transform:none}}.theme-option.active{{background:var(--card-solid);color:var(--primary);box-shadow:0 3px 10px #17243b1c}}.theme-switch.changed .theme-option.active{{animation:theme-pop .24s ease}}@keyframes theme-pop{{50%{{transform:scale(.82) rotate(-8deg)}}}}
 .badge{{display:inline-flex;align-items:center;gap:7px;padding:5px 9px;border-radius:999px;background:var(--bg-soft);color:var(--muted);font-size:12px;font-weight:750}}.badge.running{{background:var(--primary-soft);color:var(--primary)}}.badge.success{{background:var(--success-soft);color:var(--success)}}.badge.failed{{background:var(--danger-soft);color:var(--danger)}}.badge.waiting{{background:var(--warning-soft);color:var(--warning)}}.status-dot{{width:7px;height:7px;border-radius:50%;background:currentColor}}.running .status-dot{{animation:pulse 1.25s infinite}}
 .donut{{position:relative;width:156px;height:156px;box-shadow:inset 0 0 0 1px var(--border)}}.donut:after{{position:absolute;width:112px;height:112px;background:var(--card-solid);box-shadow:0 5px 20px #0001}}.donut-value{{position:absolute;z-index:1;font-size:25px;font-weight:820;letter-spacing:-.04em}}.disk-tip{{bottom:18px;display:block;opacity:0;pointer-events:none;transform:translate(-50%,8px);border-radius:11px;box-shadow:0 18px 40px #0005;transition:opacity .18s,transform .18s}}.disk-wrap:hover .disk-tip{{opacity:1;transform:translate(-50%,0)}}
-pre{{padding:16px;border-radius:12px;max-height:520px;box-shadow:inset 0 1px 7px #0000000b;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}}.log-shell{{position:relative;padding-top:28px}}.log-shell pre{{margin:0}}.log-shell:before{{content:'LIVE';position:absolute;right:2px;top:0;z-index:2;padding:3px 7px;border-radius:6px;background:var(--success-soft);color:var(--success);font-size:10px;font-weight:850;letter-spacing:.1em}}
+pre{{padding:16px;border-radius:12px;max-height:520px;box-shadow:inset 0 1px 7px #0000000b;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace}}.log-shell{{position:relative;padding-top:28px}}.log-shell pre{{margin:0}}.log-shell:before{{content:'LIVE';position:absolute;right:2px;top:0;z-index:2;padding:3px 7px;border-radius:6px;background:var(--success-soft);color:var(--success);font-size:10px;font-weight:850;letter-spacing:.1em}}.log-viewer{{padding-top:0}}.log-viewer:before{{display:none}}.log-toolbar{{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px}}.log-actions{{display:flex;gap:8px;flex-wrap:wrap}}.log-actions button{{min-height:34px;padding:6px 11px;font-size:12px}}.log-status{{font-size:12px;color:var(--muted)}}
 .progress{{height:9px}}.progress>span{{background:linear-gradient(90deg,var(--primary),#83a5ff,var(--primary));background-size:200% 100%;transition:width .45s cubic-bezier(.2,.8,.2,1);animation:shimmer 2.2s linear infinite}}.metric{{font-size:30px;font-weight:800;letter-spacing:-.04em}}th{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em}}
 .running-list{{display:grid;gap:13px}}.running-card{{padding:16px;border:1px solid var(--border);border-radius:13px;background:var(--input);animation:card-in .25s both}}.running-top{{display:flex;gap:10px;align-items:center;margin-bottom:10px;min-width:0}}.running-top b{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.running-meta{{display:flex;justify-content:space-between;gap:12px;margin:8px 0 0;color:var(--muted);font-size:13px}}.task-card{{display:flex;flex-direction:column;gap:12px;min-width:0;overflow:hidden}}.task-card>*{{min-width:0}}.task-card .card-heading>div{{min-width:0;overflow:hidden}}.task-title,.task-endpoint,.task-value,.task-meta code{{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.task-card .row:last-child{{margin-top:auto;padding-top:5px}}.empty-state{{text-align:center;padding:30px 18px;color:var(--muted)}}
 .page-heading{{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:24px}}.page-heading h1{{margin:0 0 4px}}.page-heading p{{margin:0}}.card-heading{{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}}.card-heading h1,.card-heading h2{{margin:0}}.card-kicker{{color:var(--primary);font-size:11px;font-weight:850;letter-spacing:.11em;text-transform:uppercase}}
@@ -1467,10 +1522,11 @@ addEventListener('pageshow',()=>requestAnimationFrame(tailLogs));
 const themeSwitch=document.getElementById('theme-switch'),themeOptions=[...themeSwitch.querySelectorAll('[data-theme-value]')];
 function ts(t,feedback=false){{document.documentElement.dataset.theme=t;localStorage.setItem('sb_theme',t);themeOptions.forEach(button=>{{const active=button.dataset.themeValue===t;button.classList.toggle('active',active);button.setAttribute('aria-pressed',String(active))}});if(feedback){{themeSwitch.classList.remove('changed');void themeSwitch.offsetWidth;themeSwitch.classList.add('changed');setTimeout(()=>themeSwitch.classList.remove('changed'),260)}}}}
 themeOptions.forEach(button=>button.onclick=()=>ts(button.dataset.themeValue,true));ts(document.documentElement.dataset.theme);
-const params=new URLSearchParams(location.search),notice=params.get('notice'),tone=params.get('tone')||'success';if(notice){{let box=document.getElementById('toast-stack'),toast=document.createElement('div');toast.className='toast '+tone;let dot=document.createElement('span'),copy=document.createElement('div'),heading=document.createElement('b'),detail=document.createElement('div');dot.className='status-dot';heading.textContent=tone==='error'?'操作失败':'操作完成';detail.textContent=notice;copy.append(heading,detail);toast.append(dot,copy);box.append(toast);setTimeout(()=>{{toast.classList.add('out');setTimeout(()=>toast.remove(),240)}},4200);params.delete('notice');params.delete('tone');history.replaceState(null,'',location.pathname+(params.size?'?'+params.toString():'')+location.hash)}}
+const showNotice=(detail,tone='success')=>{{let box=document.getElementById('toast-stack'),toast=document.createElement('div');toast.className='toast '+tone;let dot=document.createElement('span'),copy=document.createElement('div'),heading=document.createElement('b'),text=document.createElement('div');dot.className='status-dot';heading.textContent=tone==='error'?'操作失败':'操作完成';text.textContent=detail;copy.append(heading,text);toast.append(dot,copy);box.append(toast);setTimeout(()=>{{toast.classList.add('out');setTimeout(()=>toast.remove(),240)}},4200)}};
+const params=new URLSearchParams(location.search),notice=params.get('notice'),tone=params.get('tone')||'success';if(notice){{showNotice(notice,tone);params.delete('notice');params.delete('tone');history.replaceState(null,'',location.pathname+(params.size?'?'+params.toString():'')+location.hash)}}
 const dialog=document.getElementById('confirm-dialog'),message=document.getElementById('confirm-message');let pending=null,confirmed=false;document.querySelectorAll('form').forEach(f=>{{let action=f.getAttribute('action');if(action==='/backup/stop'){{f.removeAttribute('onsubmit');f.dataset.confirm='停止后会清除本次已下载的数据，且无法断点续传。确定停止并清除？'}}if(action==='/task/delete'){{f.removeAttribute('onsubmit');f.dataset.confirm='只删除任务设置，不删除已有备份。确定删除？'}}}});
 document.getElementById('confirm-cancel').onclick=()=>{{pending=null;dialog.close()}};document.getElementById('confirm-ok').onclick=()=>{{let item=pending;pending=null;confirmed=true;dialog.close();item?.form.requestSubmit(item.submitter)}};
-document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',e=>{{let submitter=e.submitter||f.querySelector('button'),text=submitter?.dataset.confirm||f.dataset.confirm;if(text&&!confirmed){{e.preventDefault();pending={{form:f,submitter}};message.textContent=text;dialog.showModal();return}}confirmed=false;if(submitter){{submitter.disabled=true;submitter.classList.add('is-loading');submitter.dataset.original=submitter.textContent;submitter.textContent=submitter.dataset.loading||'处理中…'}}}}));
+document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',async e=>{{let submitter=e.submitter||f.querySelector('button'),text=submitter?.dataset.confirm||f.dataset.confirm;if(text&&!confirmed){{e.preventDefault();pending={{form:f,submitter}};message.textContent=text;dialog.showModal();return}}confirmed=false;if(submitter){{submitter.disabled=true;submitter.classList.add('is-loading');submitter.setAttribute('aria-busy','true');submitter.dataset.original=submitter.textContent;submitter.textContent=submitter.dataset.loading||'处理中…'}}let action=f.getAttribute('action')||'',asyncAction=['/backup/start','/backup/pause','/backup/stop'].includes(action);if(!asyncAction)return;e.preventDefault();try{{let response=await fetch(action,{{method:'POST',headers:{{'Accept':'application/json','Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'}},body:new URLSearchParams(new FormData(f))}}),data=await response.json();if(!response.ok||!data.ok)throw new Error(data.message||'操作未完成');location.assign(data.location||'/')}}catch(error){{if(submitter){{submitter.disabled=false;submitter.classList.remove('is-loading');submitter.removeAttribute('aria-busy');submitter.textContent=submitter.dataset.original||submitter.textContent}}showNotice(error.message||'网络请求失败，请重试','error')}}}}));
 const am=document.getElementById('auth-method'),ka=document.getElementById('key-auth'),pa=document.getElementById('password-auth');
 function authUI(){{if(!am)return;ka.hidden=am.value!=='key';pa.hidden=am.value!=='password'}}if(am){{am.onchange=authUI;authUI()}}
 const so=document.getElementById('source-type'),fm=document.getElementById('file-mode'),fs=document.getElementById('file-source'),ds=document.getElementById('database-source'),ft=document.getElementById('file-threads'),rs=document.getElementById('retention-settings'),rp=document.getElementById('remote-path'),du=document.getElementById('database-user'),dn=document.getElementById('database-name');
@@ -1479,6 +1535,7 @@ const st=document.getElementById('schedule-times'),sv=document.getElementById('s
 if(st){{add.onclick=()=>{{if(st.querySelectorAll('.schedule-time').length>=24)return;st.insertAdjacentHTML('beforeend','<div class="time-row"><input class="schedule-time" type="time" value="12:00" required><button type="button" class="remove-time secondary" title="删除时间">×</button></div>')}};
 st.onclick=e=>{{if(e.target.classList.contains('remove-time')&&st.querySelectorAll('.schedule-time').length>1)e.target.parentElement.remove()}};
 st.closest('form').addEventListener('submit',()=>{{sv.value=[...st.querySelectorAll('.schedule-time')].map(i=>i.value).filter(Boolean).join(',')}})}}
+document.querySelectorAll('[data-log-viewer]').forEach(viewer=>{{const pre=viewer.querySelector('pre'),older=viewer.querySelector('[data-log-older]'),latest=viewer.querySelector('[data-log-latest]'),status=viewer.querySelector('[data-log-status]'),base=viewer.dataset.endpoint,pages=new Map();let oldest=0,paused=false,loading=false;const render=follow=>{{pre.textContent=[...pages.keys()].sort((a,b)=>b-a).map(page=>pages.get(page)).join('\\n');if(follow)pre.scrollTop=pre.scrollHeight}};async function load(page,follow=false){{if(loading)return;loading=true;older.disabled=true;status.textContent='正在读取日志…';try{{let separator=base.includes('?')?'&':'?',response=await fetch(base+separator+'page='+page+'&lines=200'),data=await response.json();if(!response.ok)throw new Error(data.message||'读取失败');pages.set(page,data.text);oldest=Math.max(oldest,page);render(follow);let capped=oldest>=9;older.disabled=!data.has_more||capped;older.textContent=capped?'已显示最近 2000 行':data.has_more?'加载更早日志':'没有更早日志';status.textContent=paused?'已暂停自动刷新 · 已加载 '+pages.size+' 页':'每 5 秒自动刷新 · 最近 '+data.line_count+' 行'}}catch(error){{older.disabled=false;status.textContent='日志读取失败';showNotice(error.message||'日志读取失败','error')}}finally{{loading=false}}}}older.addEventListener('click',()=>{{paused=true;latest.hidden=false;load(oldest+1)}});latest.addEventListener('click',()=>{{pages.clear();oldest=0;paused=false;latest.hidden=true;load(0,true)}});load(0,true);setInterval(()=>{{if(!paused&&!document.hidden)load(0,pre.scrollHeight-pre.scrollTop-pre.clientHeight<40)}},5000)}});
 </script></body></html>"""
 
     @staticmethod
@@ -1553,8 +1610,8 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
         return self.page("首页", body, token)
 
     def logs_html(self, token):
-        return self.page("日志", f"""<div class="page-heading"><div><span class="card-kicker">Diagnostics</span><h1>全部应用日志</h1><p class="muted">包含当前日志和轮转日志，打开时自动定位到最新一行。</p></div><a class="btn secondary" href="/logs/raw">下载全部日志</a></div>
-<section class="card"><div class="log-shell"><pre class="tail-log">{self.esc(self.read_log(None))}</pre></div></section>""", token)
+        return self.page("日志", """<div class="page-heading"><div><span class="card-kicker">Diagnostics</span><h1>全部应用日志</h1><p class="muted">页面按需加载最近记录；完整日志仍可直接下载。</p></div><a class="btn secondary" href="/logs/raw">下载全部日志</a></div>
+<section class="card"><div class="log-shell log-viewer" data-log-viewer data-endpoint="/api/logs"><div class="log-toolbar"><span class="log-status" data-log-status>准备读取日志…</span><div class="log-actions"><button type="button" class="secondary" data-log-latest hidden>回到最新</button><button type="button" class="secondary" data-log-older>加载更早日志</button></div></div><pre class="tail-log">正在加载最近日志…</pre></div></section>""", token)
 
     def dashboard_html(self, token):
         cards = []
@@ -1599,6 +1656,29 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
         heading = "<div class='page-heading'><div><span class='card-kicker'>Tasks</span><h1>备份任务</h1><p class='muted'>查看状态、立即运行或进入任务详情。</p></div><a class='btn' href='/task'>＋ 新建任务</a></div>"
         return self.page("任务", heading + "<div class='grid'>" + ("".join(cards) or empty) + "</div>", token)
 
+    def backup_list_html(self, task):
+        backups = self.backups(task)
+        backup_rows = []
+        for path in reversed(backups[-30:]):
+            try:
+                size = human_size(directory_size(path))
+                modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                size = "大小未知"
+                modified = "文件状态已变化"
+            backup_rows.append(
+                "<article class='backup-file'>"
+                f"<span class='backup-file-icon'>{ARCHIVE_ICON}</span>"
+                "<div class='backup-file-info'>"
+                f"<code class='file-name' title='{self.esc(path.name)}'>{self.esc(path.name)}</code>"
+                f"<div class='file-meta'><span>{size}</span><span>{modified}</span></div></div>"
+                f"<form class='inline' method='post' action='/backup/delete'><input type='hidden' name='id' value='{task['id']}'>"
+                f"<input type='hidden' name='name' value='{self.esc(path.name)}'><button class='backup-delete' data-loading='正在删除…' data-confirm='确定删除这个备份文件？此操作不可恢复。'>删除文件</button></form></article>"
+            )
+        note = f"<p class='muted'>共有 {len(backups)} 项，仅显示最近 30 项。</p>" if len(backups) > 30 else ""
+        rows = "".join(backup_rows) or '<div class="empty-state">暂无备份文件</div>'
+        return f"""<section class="card"><div class="card-heading"><div><span class="card-kicker">Archives</span><h2>已有备份</h2></div><span class="badge waiting">{len(backups)} 项</span></div>{note}<div class="backup-list">{rows}</div></section>"""
+
     def task_detail_html(self, task, token):
         if not task:
             return self.page("任务不存在", "<section class='card'><h1>任务不存在</h1></section>", token)
@@ -1625,10 +1705,11 @@ function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=102
 <p id="detail-summary">{progress}% · {human_size(transferred)} / {human_size(total) if total else '总大小暂未取得'}</p><p class="muted" id="detail-plan">并发策略：{plan}</p>
 <p class="muted">多线程模式下显示活跃传输槽位。槽位速度和已传输量来自本地断点文件的实际增长；百分比为整个任务的总体进度。</p></section>
 <section class="card"><div class="card-heading"><div><span class="card-kicker">Transfers</span><h2>活跃传输槽位</h2></div><span class="muted">每 2 秒刷新</span></div><div class="table-scroll"><table><thead><tr><th>槽位</th><th>当前文件</th><th>速度</th><th>已传输</th><th>任务进度</th></tr></thead><tbody id="slot-rows"><tr><td colspan="5" class="muted">暂无活跃传输</td></tr></tbody></table></div></section>
-<section class="card"><div class="card-heading"><div><span class="card-kicker">Task Logs</span><h2>该任务的全部日志</h2></div><a class="btn secondary" href="/logs">全部应用日志</a></div><div class="log-shell"><pre class="tail-log" id="task-log">{self.esc(self.read_task_log(task_id))}</pre></div></section>
+{self.backup_list_html(task)}
+<section class="card"><div class="card-heading"><div><span class="card-kicker">Task Logs</span><h2>任务日志</h2></div><a class="btn secondary" href="/logs">全部应用日志</a></div><div class="log-shell log-viewer" data-log-viewer data-endpoint="/api/task-log?id={task_id}"><div class="log-toolbar"><span class="log-status" data-log-status>准备读取日志…</span><div class="log-actions"><button type="button" class="secondary" data-log-latest hidden>回到最新</button><button type="button" class="secondary" data-log-older>加载更早日志</button></div></div><pre class="tail-log" id="task-log">正在加载最近日志…</pre></div></section>
 <script>const taskId={json.dumps(task_id)};function fmt(n){{let u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return n.toFixed(1)+' '+u[i]}}
 async function detail(){{let r=await fetch('/api/status'),d=await r.json(),x=d.running.find(v=>v.id===taskId),rows=document.getElementById('slot-rows');rows.replaceChildren();if(!x){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='当前没有活跃传输';return}}document.getElementById('detail-phase').textContent=x.phase;let badge=document.getElementById('detail-badge');badge.className='badge running';badge.lastChild.textContent=x.phase;document.getElementById('detail-bar').style.width=x.progress+'%';document.getElementById('detail-summary').textContent=(x.total_bytes?x.progress+'% · '+fmt(x.transferred_bytes)+' / '+fmt(x.total_bytes):fmt(x.transferred_bytes)+' · '+fmt(x.speed_bps)+'/s · 正在计算总大小');document.getElementById('detail-plan').textContent='并发策略：'+x.parallel_files+' 条 rsync 连接 · 固定清单传输';if(!x.slots.length){{let tr=rows.insertRow(),td=tr.insertCell();td.colSpan=5;td.className='muted';td.textContent='正在等待文件数据';return}}x.slots.forEach(s=>{{let tr=rows.insertRow(),slot=tr.insertCell(),file=tr.insertCell(),speed=tr.insertCell(),bytes=tr.insertCell(),progressCell=tr.insertCell(),mini=document.createElement('div'),fill=document.createElement('span');slot.textContent='#'+s.slot;file.textContent=s.name;speed.textContent=fmt(s.speed_bps)+'/s';speed.className='slot-speed';bytes.textContent=fmt(s.bytes);progressCell.append(s.progress+'%');mini.className='mini-progress';fill.style.width=s.progress+'%';mini.append(fill);progressCell.append(mini)}})}}
-async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURIComponent(taskId)),p=document.getElementById('task-log'),t=await r.text(),follow=p.scrollHeight-p.scrollTop-p.clientHeight<40;p.textContent=t;if(follow)p.scrollTop=p.scrollHeight}}detail();setInterval(detail,2000);setInterval(taskLog,5000);</script>"""
+detail();setInterval(detail,2000);</script>"""
         return self.page("任务详情", body, token)
 
     def task_form_html(self, task, token):
@@ -1643,25 +1724,6 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
             '<button type="button" class="remove-time secondary" title="删除时间">×</button></div>'
             for value in task["schedule_times"]
         )
-        backups = self.backups(task) if task.get("id") else []
-        backup_rows = []
-        for path in reversed(backups[-30:]):
-            try:
-                size = human_size(directory_size(path))
-                modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            except OSError:
-                size = "大小未知"
-                modified = "文件状态已变化"
-            backup_rows.append(
-                "<article class='backup-file'>"
-                f"<span class='backup-file-icon'>{ARCHIVE_ICON}</span>"
-                "<div class='backup-file-info'>"
-                f"<code class='file-name' title='{self.esc(path.name)}'>{self.esc(path.name)}</code>"
-                f"<div class='file-meta'><span>{size}</span><span>{modified}</span></div></div>"
-                f"<form class='inline' method='post' action='/backup/delete'><input type='hidden' name='id' value='{task_id}'>"
-                f"<input type='hidden' name='name' value='{self.esc(path.name)}'><button class='backup-delete' data-loading='正在删除…' data-confirm='确定删除这个备份文件？此操作不可恢复。'>删除文件</button></form></article>"
-            )
-        backup_rows = "".join(backup_rows)
         delete_task = (
             "<section class='danger-zone'><div class='danger-zone-copy'><span class='card-kicker'>Danger zone</span>"
             "<h2>删除任务</h2><p>只删除任务设置，不会删除已经保存的备份文件。</p></div>"
@@ -1678,7 +1740,7 @@ async function taskLog(){{let r=await fetch('/api/task-log?id='+encodeURICompone
 <div class="form-section"><div class="section-heading"><span class="section-icon">5</span><div><h2>自动执行计划</h2><p>备份周期和一天内的时间点可以分别设置。</p></div></div><div class="form-grid"><div><label>每隔几天备份</label><input name="interval_days" type="number" min="1" max="3650" step="1" required value="{task['interval_days']}"></div><div><label>在这些时间点备份</label><div id="schedule-times">{time_inputs}</div><button type="button" class="secondary" id="add-time">＋ 添加时间</button><input type="hidden" id="schedule-times-value" name="schedule_times"><small class="muted">例如每隔 1 天，设置 02:00 和 14:00，就是每天备份两次。</small></div></div></div>
 <div class="form-section"><div class="section-heading"><span class="section-icon">6</span><div><h2>自动化选项</h2><p>这些选项可以随时回来修改。</p></div></div><div class="check-row"><label><input type="checkbox" name="enabled" {checked('enabled')}> 启用自动备份</label><label><input type="checkbox" name="auto_install_dependencies" {checked('auto_install_dependencies')}> 首次连接自动安装对应备份客户端</label></div></div>
 <div class="form-actions"><a class="btn secondary" href="/tasks">取消</a><button data-loading="正在保存…">保存任务</button></div></form></section>
-<section class="card form-shell"><div class="card-heading"><div><span class="card-kicker">Archives</span><h2>已有备份</h2></div><span class="badge waiting">{len(backups)} 项</span></div><div class="backup-list">{backup_rows or '<div class="empty-state">暂无备份文件</div>'}</div></section>{delete_task}"""
+{delete_task}"""
         return self.page("任务设置", body, token)
 
     def settings_html(self, token):
@@ -1894,6 +1956,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_json(self, value, status=200):
+        data = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def wants_json(self):
+        return "application/json" in self.headers.get("Accept", "")
+
     def redirect(self, location, cookie=None):
         self.send_response(303)
         self.send_header("Location", location)
@@ -1928,7 +2004,13 @@ class Handler(BaseHTTPRequestHandler):
         ]
         query.extend((('notice', message), ('tone', tone)))
         location = urllib.parse.urlunsplit(('', '', parsed.path, urllib.parse.urlencode(query), parsed.fragment))
-        self.redirect(location)
+        if self.wants_json():
+            self.send_json(
+                {"ok": tone != "error", "message": message, "location": location},
+                400 if tone == "error" else 200,
+            )
+        else:
+            self.redirect(location)
 
     def form(self):
         try:
@@ -2000,9 +2082,21 @@ class Handler(BaseHTTPRequestHandler):
         elif path.path == "/api/task-log":
             task_id = query.get("id", [""])[0]
             if self.app.task(task_id):
-                self.send_data(self.app.read_task_log(task_id), "text/plain; charset=utf-8")
+                try:
+                    page = int(query.get("page", ["0"])[0])
+                    lines = int(query.get("lines", ["200"])[0])
+                except ValueError:
+                    page, lines = 0, 200
+                self.send_json(self.app.read_log_page(page, lines, task_id))
             else:
-                self.send_data("任务不存在", "text/plain; charset=utf-8")
+                self.send_json({"message": "任务不存在"}, 404)
+        elif path.path == "/api/logs":
+            try:
+                page = int(query.get("page", ["0"])[0])
+                lines = int(query.get("lines", ["200"])[0])
+            except ValueError:
+                page, lines = 0, 200
+            self.send_json(self.app.read_log_page(page, lines))
         elif path.path == "/api/status":
             running = [
                 {
@@ -2035,7 +2129,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.require_auth():
                 return
             if not self.csrf_valid(form):
-                self.send_html(self.app.page("请求无效", "<section class='card'><h1>页面已过期，请刷新后重试</h1></section>"), 403)
+                if self.wants_json():
+                    self.send_json({"ok": False, "message": "页面已过期，请刷新后重试", "location": "/login"}, 403)
+                else:
+                    self.send_html(self.app.page("请求无效", "<section class='card'><h1>页面已过期，请刷新后重试</h1></section>"), 403)
                 return
             self.handle_action(form)
         except (ValueError, OSError) as exc:
@@ -2104,14 +2201,14 @@ class Handler(BaseHTTPRequestHandler):
             ok, message = self.app.start_backup(task_id, source)
             if not ok:
                 raise ValueError(message)
-            self.redirect_notice(form, message, '/tasks')
+            self.redirect_notice(form, message, target='/')
         elif path in ("/backup/pause", "/backup/stop"):
             ok, message = self.app.stop_backup(
                 form.get("id", ""), path == "/backup/stop", "网页"
             )
             if not ok:
                 raise ValueError(message)
-            self.redirect_notice(form, message, '/tasks')
+            self.redirect_notice(form, message, target='/')
         elif path == "/backup/delete":
             task = self.app.task(form.get("id", ""))
             allowed = {p.name: p for p in self.app.backups(task)} if task else {}
@@ -2120,7 +2217,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("备份不存在")
             self.app.delete_backup(target)
             self.app.notify(f"已删除备份：{task['name']} / {target.name}", task["id"])
-            self.redirect_notice(form, f'已删除备份：{target.name}', f"/task?id={task['id']}")
+            self.redirect_notice(form, f'已删除备份：{target.name}', f"/task/detail?id={task['id']}")
         elif path == "/settings":
             username = form.get("admin_username", "").strip()
             if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,50}", username):
