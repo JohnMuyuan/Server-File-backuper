@@ -392,7 +392,9 @@ class BackupManagerTest(unittest.TestCase):
             self.assertIn("只属于这个任务", app.read_task_log(progress_task["id"]))
             detail = app.task_detail_html(progress_task, app.sign_session("panel-user"))
             self.assertIn("活跃传输槽位", detail)
-            self.assertIn("该任务的全部日志", detail)
+            self.assertIn("任务日志", detail)
+            self.assertIn("data-log-viewer", detail)
+            self.assertNotIn("只属于这个任务", detail)
             self.assertIn("theme-switch", detail)
             self.assertIn('data-theme-value="light"', detail)
 
@@ -475,12 +477,22 @@ class BackupManagerTest(unittest.TestCase):
             long_name = "20260720-120000_" + ("very-long-backup-name-" * 7) + "_" + backup_prefix(task) + ".tar.zst"
             (backup_dir / long_name).write_bytes(b"backup")
             task_form = app.task_form_html(task, token)
+            task_detail = app.task_detail_html(task, token)
             for marker in (
                 "backup-list", "backup-file", "file-name", "overflow-wrap:anywhere",
-                "danger-zone", "danger-outline", "删除文件", long_name,
+                "删除文件", long_name,
             ):
-                self.assertIn(marker, task_form)
+                self.assertIn(marker, task_detail)
+            self.assertNotIn(long_name, task_form)
+            self.assertNotIn("<h2>已有备份</h2>", task_form)
+            self.assertIn("danger-zone", task_form)
+            self.assertIn("danger-outline", task_form)
             self.assertIn("SSH 中转服务器", task_form)
+            for marker in (
+                "data-log-viewer", "加载更早日志", "回到最新", "lines=200",
+                "application/json", "location.assign", "每 5 秒自动刷新",
+            ):
+                self.assertIn(marker, task_detail)
 
             settings = app.settings_html(token)
             self.assertIn("settings-grid", settings)
@@ -509,6 +521,45 @@ class BackupManagerTest(unittest.TestCase):
                 "/fallback",
             )
             self.assertEqual(Handler.safe_return_to({}, "/fallback"), "/fallback")
+
+    def test_bounded_log_pages_and_backup_action_home_redirect(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            app = BackupApp(root / "data")
+            task = sample_task(root / "backups")
+            app.config["tasks"] = [task]
+            for index in range(450):
+                app.log(f"分页日志 {index:03d}", task_id=task["id"])
+                if index % 50 == 0:
+                    app.log(f"其他任务 {index:03d}", task_id="deadbeef")
+
+            newest = app.read_log_page(0, 200, task["id"])
+            middle = app.read_log_page(1, 200, task["id"])
+            oldest = app.read_log_page(2, 200, task["id"])
+            self.assertEqual(newest["line_count"], 200)
+            self.assertTrue(newest["has_more"])
+            self.assertIn("分页日志 449", newest["text"])
+            self.assertNotIn("分页日志 249", newest["text"])
+            self.assertIn("分页日志 249", middle["text"])
+            self.assertEqual(oldest["line_count"], 50)
+            self.assertFalse(oldest["has_more"])
+            self.assertIn("分页日志 000", oldest["text"])
+            self.assertNotIn("其他任务", newest["text"] + middle["text"] + oldest["text"])
+
+            handler = object.__new__(Handler)
+            handler.app = app
+            captured = {}
+            app.start_backup = lambda task_id, source: (True, "备份已在后台启动")
+            handler.redirect_notice = lambda form, message, *args, **kwargs: captured.update(kwargs)
+            handler.path = "/backup/start"
+            handler.handle_action({"id": task["id"]})
+            self.assertEqual(captured.get("target"), "/")
+
+            captured.clear()
+            app.stop_backup = lambda task_id, discard, source: (True, "已发送暂停指令")
+            handler.path = "/backup/pause"
+            handler.handle_action({"id": task["id"]})
+            self.assertEqual(captured.get("target"), "/")
 
     def test_installer_does_not_overwrite_panel_port(self):
         script = Path("install.sh").read_text(encoding="utf-8")
