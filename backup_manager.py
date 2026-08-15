@@ -365,10 +365,13 @@ class BackupApp:
         return next((item for item in self.config["tasks"] if item["id"] == task_id), None)
 
     def task_state(self, task_id):
-        return self.state["tasks"].setdefault(task_id, {
+        state = self.state["tasks"].setdefault(task_id, {
             "next_run": 0, "last_result": "尚未运行", "last_backup": "",
             "last_error": "", "dependencies_ready": False, "schedule_anchor": "",
+            "resume_on_start": True,
         })
+        state.setdefault("resume_on_start", True)
+        return state
 
     def next_scheduled(self, task, state, after=None):
         after_dt = datetime.fromtimestamp(after or time.time())
@@ -843,21 +846,35 @@ class BackupApp:
         path.mkdir(parents=True, exist_ok=True)
         return shutil.disk_usage(path).free
 
-    def stop_all(self, reason="用户要求停止", discard=False):
+    def _mark_stop_requested(self, task_id):
+        state = self.task_state(task_id)
+        state["resume_on_start"] = False
+        task = self.task(task_id)
+        if task:
+            state["next_run"] = self.next_scheduled(task, state, time.time() + 1)
+
+    def stop_all(self, reason="用户要求停止", discard=False, prevent_resume=True):
         with self.lock:
-            jobs = list(self.jobs.values())
-        for job in jobs:
-            job["reason"] = reason
-            job["discard_partial"] = discard
-            job["stop"].set()
+            jobs = list(self.jobs.items())
+            for task_id, job in jobs:
+                if prevent_resume:
+                    self._mark_stop_requested(task_id)
+                job["reason"] = reason
+                job["discard_partial"] = discard
+                job["stop"].set()
+            if jobs and prevent_resume:
+                self._save_state()
 
     def stop_backup(self, task_id, discard=False, source="网页"):
-        job = self.jobs.get(task_id)
-        if not job:
-            return False, "任务当前未运行"
-        job["discard_partial"] = discard
-        job["reason"] = f"{source}{'停止并清除断点' if discard else '临时暂停'}"
-        job["stop"].set()
+        with self.lock:
+            job = self.jobs.get(task_id)
+            if not job:
+                return False, "任务当前未运行"
+            self._mark_stop_requested(task_id)
+            job["discard_partial"] = discard
+            job["reason"] = f"{source}{'停止并清除断点' if discard else '临时暂停'}"
+            job["stop"].set()
+            self._save_state()
         return True, "已发送停止指令" if discard else "已发送暂停指令"
 
     @staticmethod
@@ -1275,6 +1292,9 @@ class BackupApp:
                 "remote_scanned": False, "discard_partial": False,
             }
             self.jobs[task_id] = job
+            state = self.task_state(task_id)
+            state.update(last_result="运行中", last_error="", resume_on_start=True)
+            self._save_state()
         threading.Thread(target=self._backup_worker, args=(dict(task), job, source), daemon=True).start()
         return True, "备份已在后台启动"
 
@@ -1288,7 +1308,9 @@ class BackupApp:
             for attempt in range(1, 7):
                 try:
                     final, size, free = self.backup_once(task, job)
-                    state.update(last_result="成功", last_backup=final.name, last_error="")
+                    state.update(
+                        last_result="成功", last_backup=final.name, last_error="", resume_on_start=False,
+                    )
                     if source == "定时":
                         state["next_run"] = self.next_scheduled(task, state, time.time() + 1)
                     self._save_state()
@@ -1318,14 +1340,18 @@ class BackupApp:
                 discarded = job.get("discard_partial", False)
                 if discarded:
                     self.clear_partial(task)
-                state.update(last_result="已停止" if discarded else "已暂停", last_error=error)
+                state.update(
+                    last_result="已停止" if discarded else "已暂停",
+                    last_error=error,
+                    resume_on_start=False,
+                )
                 self._save_state()
                 self.notify(
                     f"备份{'已停止并清除断点' if discarded else '已暂停，断点已保留'}：{task['name']}\n原因：{error}",
                     task["id"],
                 )
                 return
-            state.update(last_result="失败", last_error=error)
+            state.update(last_result="失败", last_error=error, resume_on_start=False)
             if source == "定时":
                 state["next_run"] = self.next_scheduled(task, state, time.time() + 1)
             self._save_state()
@@ -1337,7 +1363,11 @@ class BackupApp:
     def resume_interrupted(self):
         resumed = 0
         for task in self.config["tasks"]:
-            if self.task_state(task["id"]).get("last_result") != "运行中":
+            state = self.task_state(task["id"])
+            if (
+                state.get("last_result") != "运行中"
+                or state.get("resume_on_start", True) is False
+            ):
                 continue
             ok, _ = self.start_backup(task["id"], "服务重启后自动续传")
             resumed += int(ok)
@@ -2301,7 +2331,7 @@ def serve(app):
         server.serve_forever()
     finally:
         app.stop_daemon.set()
-        app.stop_all("服务正在停止")
+        app.stop_all("服务正在停止", prevent_resume=False)
         server.server_close()
 
 

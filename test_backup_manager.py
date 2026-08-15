@@ -431,6 +431,47 @@ class BackupManagerTest(unittest.TestCase):
             self.assertFalse(partial.exists())
             self.assertTrue(history.exists())
 
+    def test_stop_does_not_restart_or_resume_task(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = sample_task(root / "backups")
+            app = BackupApp(root / "data")
+            app.config["tasks"] = [task]
+            now = time.time()
+            state = app.task_state(task["id"])
+            state.update(
+                last_result="运行中",
+                next_run=now - 1,
+                schedule_anchor=datetime.fromtimestamp(now).strftime("%Y-%m-%d"),
+            )
+            event = threading.Event()
+            app.jobs[task["id"]] = {"stop": event, "discard_partial": False}
+
+            ok, _ = app.stop_backup(task["id"], True)
+            self.assertTrue(ok)
+            self.assertTrue(event.is_set())
+            self.assertFalse(state["resume_on_start"])
+            self.assertGreater(state["next_run"], time.time())
+
+            app.jobs.pop(task["id"])
+            starts = []
+            app.start_backup = lambda task_id, source: starts.append((task_id, source)) or (True, "ok")
+            self.assertEqual(app.resume_interrupted(), 0)
+
+            class OnePassStop:
+                def __init__(self):
+                    self.calls = 0
+
+                def wait(self, _timeout):
+                    self.calls += 1
+                    return self.calls > 1
+
+            app.stop_daemon = OnePassStop()
+            app.disk_guard = lambda _task: True
+            app.poll_telegram = lambda: None
+            app.scheduler_loop()
+            self.assertEqual(starts, [])
+
     def test_redirect_is_framed_and_closed(self):
         class Response:
             def __init__(self):
